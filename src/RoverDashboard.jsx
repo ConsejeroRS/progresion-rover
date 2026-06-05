@@ -356,7 +356,18 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(0.45) sepia(1)
 .ni{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:5px;padding:4px 7px;color:#C0B0A0;font-size:12px;outline:none;width:100%;resize:none}
 .ni:focus{border-color:rgba(201,162,39,0.3)}
 .ebtn:hover{background:rgba(201,162,39,0.18)!important}
+@media(max-width:640px){
+  .mobile-sidebar{position:fixed;top:0;left:0;height:100vh;width:80vw;max-width:300px;z-index:300;transform:translateX(-100%);transition:transform 0.25s ease}
+  .mobile-sidebar.open{transform:translateX(0)}
+  .mobile-overlay{display:block!important}
+  .radar-grid{grid-template-columns:1fr!important}
+}
+@media(min-width:641px){
+  .mobile-sidebar{position:relative;transform:none!important}
+  .mobile-menu-btn{display:none!important}
+}
 `;
+
 
 // ─── FIREBASE HELPERS ────────────────────────────────────────────────────────
 async function fbGet(docPath) {
@@ -400,6 +411,7 @@ export default function RoverDashboard({ isAdmin = false }) {
   const [expItem, setExpItem]   = useState(null);
   const [exportMenu, setExportMenu] = useState(false);
   const [collapsedSecs, setCollapsedSecs] = useState({});
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const saveTimer = useRef(null);
 
   // ── Load from Firebase ────────────────────────────────────────────────────
@@ -542,6 +554,10 @@ export default function RoverDashboard({ isAdmin = false }) {
         padding:"9px 16px", background:"linear-gradient(90deg,#0E0804,#130B06)",
         borderBottom:"1px solid rgba(201,162,39,0.12)", flexShrink:0, gap:"12px", flexWrap:"wrap" }}>
         <div style={{ display:"flex", alignItems:"center", gap:"11px" }}>
+          <button className="mobile-menu-btn"
+            onClick={() => setMobileMenuOpen(o => !o)}
+            style={{ background:"none", border:"none", color:"#C9A227", fontSize:"20px",
+              cursor:"pointer", padding:"4px", lineHeight:1 }}>☰</button>
           <span style={{ fontSize:"24px", color:"#D63031", lineHeight:1 }}>⚜</span>
           <div>
             <div style={{ fontFamily:"'Cinzel',serif", fontSize:"14px", fontWeight:"700",
@@ -623,9 +639,15 @@ export default function RoverDashboard({ isAdmin = false }) {
         </div>
       </header>
 
-      <div style={{ display:"flex", flex:1, overflow:"hidden" }}>
+      <div style={{ display:"flex", flex:1, overflow:"hidden", position:"relative" }}>
+        {/* Mobile overlay */}
+        <div className="mobile-overlay"
+          onClick={() => setMobileMenuOpen(false)}
+          style={{ display:"none", position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", zIndex:299 }} />
+
         {/* ── SIDEBAR ── */}
-        <aside style={{ width:"218px", flexShrink:0, background:"#0D0704",
+        <aside className={`mobile-sidebar${mobileMenuOpen ? " open" : ""}`}
+          style={{ width:"218px", flexShrink:0, background:"#0D0704",
           borderRight:"1px solid rgba(201,162,39,0.08)", padding:"10px 8px",
           overflowY:"auto", display:"flex", flexDirection:"column", gap:"5px" }}>
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
@@ -696,7 +718,7 @@ export default function RoverDashboard({ isAdmin = false }) {
                   borderRadius:"8px", padding:"8px 10px", cursor:"pointer",
                   display:"flex", alignItems:"center", gap:"8px",
                   transition:"background 0.12s" }}
-                onClick={() => { setSelId(sc.id); setCurrentView("overview"); }}>
+                onClick={() => { setSelId(sc.id); setCurrentView("overview"); setMobileMenuOpen(false); }}>
                 <div style={{ flex:1, minWidth:0 }}>
                   <div style={{ fontSize:"13px", fontWeight:"600", color: isSel ? "#F0ECE8" : "#9A7A60",
                     whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis",
@@ -817,7 +839,7 @@ export default function RoverDashboard({ isAdmin = false }) {
                     onClick={() => setStageId(st.id)}>{st.numeral} {st.name}</button>
                 ))}
               </div>
-              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"16px" }}>
+              <div className="radar-grid" style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"16px" }}>
                 <div style={{ background:"rgba(14,7,2,0.97)",
                   border:`1px solid ${activeSt.color}33`, borderRadius:"12px", padding:"20px" }}>
                   <div style={{ fontFamily:"'Cinzel',serif", fontSize:"10px",
