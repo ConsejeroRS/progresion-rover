@@ -641,9 +641,10 @@ export default function RoverDashboard({ isAdmin = false }) {
 
       <div style={{ display:"flex", flex:1, overflow:"hidden", position:"relative" }}>
         {/* Mobile overlay */}
-        <div className="mobile-overlay"
-          onClick={() => setMobileMenuOpen(false)}
-          style={{ display:"none", position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", zIndex:299 }} />
+        {mobileMenuOpen && (
+          <div onClick={() => setMobileMenuOpen(false)}
+            style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", zIndex:299 }} />
+        )}
 
         {/* ── SIDEBAR ── */}
         <aside className={`mobile-sidebar${mobileMenuOpen ? " open" : ""}`}
