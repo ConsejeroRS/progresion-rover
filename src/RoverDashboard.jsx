@@ -606,6 +606,7 @@ export default function RoverDashboard() {
   }, []);
 
   // ── Firestore: escucha en tiempo real ──
+  const initialSelDone = useRef(false);
   useEffect(() => {
     const unsub = onSnapshot(DOC_REF,
       (snap) => {
@@ -619,7 +620,10 @@ export default function RoverDashboard() {
         setAttendance(merged.attendance || {});
         setLoading(false);
         setSaveErr(false);
-        if (!selId && (merged.scouts || []).length) setSelId(merged.scouts[0].id);
+        if (!initialSelDone.current && (merged.scouts || []).length) {
+          initialSelDone.current = true;
+          setSelId(merged.scouts[0].id);
+        }
       },
       (error) => { setLoading(false); setSaveErr(true); }
     );
@@ -647,24 +651,26 @@ export default function RoverDashboard() {
   const addScout = () => {
     if (!isAdmin || !newName.trim()) return;
     const sc = { id: Date.now().toString(36) + Math.random().toString(36).slice(2,6), name: newName.trim(), group: newGroup.trim() };
-    const upd = [...scouts, sc];
+    const upd = [...dataRef.current.scouts, sc];
     saveScouts(upd);
     setSelId(sc.id); setNewName(""); setNewGroup(""); setAdding(false);
   };
   const deleteScout = (id) => {
     if (!isAdmin) return;
-    const upd = scouts.filter(s => s.id !== id);
+    const cur = dataRef.current;
+    const upd = cur.scouts.filter(s => s.id !== id);
     saveScouts(upd); if (selId === id) setSelId(upd[0]?.id || null);
-    const na = { ...attendance };
+    const na = { ...cur.attendance };
     Object.keys(na).forEach(k => { if (k.startsWith(`att:${id}|`)) delete na[k]; });
     saveAtt(na);
   };
   const moveScout = (id, dir) => {
     if (!isAdmin) return;
-    const i = scouts.findIndex(s => s.id === id);
+    const list = dataRef.current.scouts;
+    const i = list.findIndex(s => s.id === id);
     const j = i + dir;
-    if (i < 0 || j < 0 || j >= scouts.length) return;
-    const upd = [...scouts];
+    if (i < 0 || j < 0 || j >= list.length) return;
+    const upd = [...list];
     [upd[i], upd[j]] = [upd[j], upd[i]];
     saveScouts(upd);
   };
@@ -672,38 +678,44 @@ export default function RoverDashboard() {
   // ── Progresión ──
   const toggleItem = (stId, sec, idx) => {
     if (!isAdmin || !selId) return;
+    const cur = dataRef.current;
     const k = pKey(selId, stId, sec, idx);
-    const now = !prog[k];
-    const np = { ...prog, [k]: now };
-    const ndt = { ...dates };
+    const now = !cur.prog[k];
+    const np = { ...cur.prog, [k]: now };
+    const ndt = { ...cur.dates };
     const dk = dKey(selId, stId, sec, idx);
     if (now && !ndt[dk]) ndt[dk] = new Date().toISOString().split("T")[0];
-    saveProg(np); saveDates(ndt);
+    setProg(np); setDates(ndt);
+    persist({ prog: np, dates: ndt });
   };
   const setItemDate = (stId, sec, idx, val) => {
     if (!isAdmin || !selId) return;
-    saveDates({ ...dates, [dKey(selId, stId, sec, idx)]: val });
+    const nd = { ...dataRef.current.dates, [dKey(selId, stId, sec, idx)]: val };
+    saveDates(nd);
   };
   const toggleInv = (stId) => {
     if (!isAdmin || !selId) return;
+    const cur = dataRef.current;
     const k = invKey(selId, stId);
-    saveInv({ ...invDates, [k]: invDates[k] ? "" : new Date().toISOString().split("T")[0] });
+    const ni = { ...cur.invDates, [k]: cur.invDates[k] ? "" : new Date().toISOString().split("T")[0] };
+    saveInv(ni);
   };
   const toggleSec = (key) => setCollapsedSecs(p => ({ ...p, [key]: !p[key] }));
 
   // ── Asistencia (solo admin marca; todos ven) ──
   const cycleAttStatus = (scoutId, date) => {
     if (!isAdmin) return;
+    const cur = dataRef.current.attendance;
     const k = attKey(scoutId, date);
-    const curr = attendance[k];
-    if (!curr) { saveAtt({ ...attendance, [k]: { status: "presente", note: "" } }); return; }
+    const curr = cur[k];
+    if (!curr) { saveAtt({ ...cur, [k]: { status: "presente", note: "" } }); return; }
     const idx = ATT_CYCLE.indexOf(curr.status);
     if (idx === ATT_CYCLE.length - 1) {
-      const na = { ...attendance };
+      const na = { ...cur };
       delete na[k];
       saveAtt(na);
     } else {
-      saveAtt({ ...attendance, [k]: { ...curr, status: ATT_CYCLE[idx + 1] } });
+      saveAtt({ ...cur, [k]: { ...curr, status: ATT_CYCLE[idx + 1] } });
     }
   };
 
@@ -849,7 +861,7 @@ export default function RoverDashboard() {
               <div style={{ display:"flex", gap:"5px" }}>
                 <button className="add-btn" title="Ordenar por % de progreso (mayor a menor)"
                   onClick={() => {
-                    const upd = [...scouts].sort((a, b) => totalStats(b.id).pct - totalStats(a.id).pct);
+                    const upd = [...dataRef.current.scouts].sort((a, b) => totalStats(b.id).pct - totalStats(a.id).pct);
                     saveScouts(upd);
                   }}
                   style={{ width:"22px", height:"22px", background:"rgba(201,162,39,0.08)",
