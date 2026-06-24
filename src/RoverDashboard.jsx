@@ -607,39 +607,48 @@ export default function RoverDashboard() {
 
   // ── Firestore: escucha en tiempo real ──
   const initialSelDone = useRef(false);
+  const pendingWrites = useRef(0);
   useEffect(() => {
     const unsub = onSnapshot(DOC_REF,
       (snap) => {
         const d = snap.exists() ? snap.data() : EMPTY_DATA;
         const merged = { ...EMPTY_DATA, ...d };
-        dataRef.current = merged;
-        setScouts(merged.scouts || []);
-        setProg(merged.prog || {});
-        setDates(merged.dates || {});
-        setInvDates(merged.invDates || {});
-        setAttendance(merged.attendance || {});
         setLoading(false);
         setSaveErr(false);
         if (!initialSelDone.current && (merged.scouts || []).length) {
           initialSelDone.current = true;
           setSelId(merged.scouts[0].id);
         }
+        // Si hay escrituras locales aún sin confirmar, no pisamos dataRef/estado
+        // con este snapshot (podría reflejar un punto del servidor anterior a
+        // un clic que el usuario ya hizo y que está en cola para guardarse).
+        if (pendingWrites.current > 0) return;
+        dataRef.current = merged;
+        setScouts(merged.scouts || []);
+        setProg(merged.prog || {});
+        setDates(merged.dates || {});
+        setInvDates(merged.invDates || {});
+        setAttendance(merged.attendance || {});
       },
       (error) => { setLoading(false); setSaveErr(true); }
     );
     return unsub;
   }, []);
 
-  // ── Guardado: persiste el documento en Firestore (merge para evitar pérdidas) ──
-  const persist = async (patch) => {
+  // ── Guardado: persiste el documento en Firestore, en cola secuencial ──
+  // (evita que clics rápidos disparen escrituras en paralelo que se pisen entre sí)
+  const writeQueue = useRef(Promise.resolve());
+  const persist = (patch) => {
     const next = { ...dataRef.current, ...patch };
     dataRef.current = next;
-    try {
-      await setDoc(DOC_REF, next, { merge: true });
-      setSaveErr(false);
-    } catch (e) {
-      setSaveErr(true);
-    }
+    pendingWrites.current += 1;
+    writeQueue.current = writeQueue.current
+      .catch(() => {}) // no dejar que un fallo anterior bloquee la cola
+      .then(() => setDoc(DOC_REF, next, { merge: true }))
+      .then(() => setSaveErr(false))
+      .catch(() => setSaveErr(true))
+      .finally(() => { pendingWrites.current = Math.max(0, pendingWrites.current - 1); });
+    return writeQueue.current;
   };
   const saveScouts = (v) => { setScouts(v); persist({ scouts: v }); };
   const saveProg   = (v) => { setProg(v);   persist({ prog: v }); };
