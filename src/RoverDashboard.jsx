@@ -1,4 +1,12 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { db, auth } from "./firebase";
+import {
+  doc, onSnapshot, setDoc, getDoc
+} from "firebase/firestore";
+import {
+  signInWithEmailAndPassword, signOut, onAuthStateChanged
+} from "firebase/auth";
+
 // ─── ETAPAS COMPLETAS (Cartilla 2.0 – solo 3 etapas) ─────────────────────────
 const STAGES = [
   {
@@ -182,7 +190,6 @@ const STAGES = [
 // ─── KEYS ─────────────────────────────────────────────────────────────────────
 const pKey = (sid, stId, sec, idx) => `${sid}|${stId}|${sec}|${idx}`;
 const dKey = (sid, stId, sec, idx) => `d:${sid}|${stId}|${sec}|${idx}`;
-const nKey = (sid, stId, sec, idx) => `n:${sid}|${stId}|${sec}|${idx}`;
 const invKey = (sid, stId) => `inv:${sid}|${stId}`;
 const attKey = (sid, date) => `att:${sid}|${date}`;
 
@@ -244,305 +251,454 @@ function RadarChart({ stage, scoutId, prog, size = 200 }) {
   );
 }
 
-// ─── EXPORT: HTML/PDF ─────────────────────────────────────────────────────────
-function exportHTML(scout, prog, dates, notes, attendance) {
-  const today = new Date().toLocaleDateString("es-GT", { day: "2-digit", month: "long", year: "numeric" });
-  let totalD = 0, totalT = 0;
-  const stagesData = STAGES.map(st => {
-    const secs = st.sections.map(sec => {
-      const its = sec.items.map((item, idx) => {
-        const done = !!prog[pKey(scout.id, st.id, sec.name, idx)];
-        return { item, done, date: dates[dKey(scout.id, st.id, sec.name, idx)] || "", note: notes[nKey(scout.id, st.id, sec.name, idx)] || "" };
-      });
-      const d = its.filter(i => i.done).length;
-      return { name: sec.name, items: its, d, t: its.length };
-    });
-    const d = secs.reduce((a, s) => a + s.d, 0);
-    const t = secs.reduce((a, s) => a + s.t, 0);
-    totalD += d; totalT += t;
-    return { ...st, secs, d, t, pct: t ? Math.round(d / t * 100) : 0 };
-  });
-  const pct = totalT ? Math.round(totalD / totalT * 100) : 0;
+// ─── HELPERS DE CÁLCULO (compartidos por export y UI) ──────────────────────────
+function scoutStageStats(scout, stage, prog) {
+  let t = 0, d = 0;
+  stage.sections.forEach(sec => sec.items.forEach((_, i) => {
+    t++; if (prog[pKey(scout.id, stage.id, sec.name, i)]) d++;
+  }));
+  return { t, d, pct: t ? Math.round(d / t * 100) : 0 };
+}
+function scoutTotalStats(scout, prog) {
+  let t = 0, d = 0;
+  STAGES.forEach(st => { const s = scoutStageStats(scout, st, prog); t += s.t; d += s.d; });
+  return { t, d, pct: t ? Math.round(d / t * 100) : 0 };
+}
+function scoutAttendanceStats(scout, attendance) {
+  const list = Object.entries(attendance)
+    .filter(([k]) => k.startsWith(`att:${scout.id}|`))
+    .map(([k, v]) => ({ date: k.split("|")[1], status: v.status, note: v.note || "" }));
+  const t = list.length;
+  const p = list.filter(r => r.status === "presente").length;
+  const a = list.filter(r => r.status === "ausente").length;
+  const e = list.filter(r => r.status === "excusa").length;
+  return { t, p, a, e, pct: t ? Math.round(p / t * 100) : 0, list: list.sort((x,y)=>x.date.localeCompare(y.date)) };
+}
+function scoutCurrentStage(scout, prog) {
+  for (let i = STAGES.length - 1; i >= 0; i--) {
+    const s = scoutStageStats(scout, STAGES[i], prog);
+    if (s.pct === 100 && i < STAGES.length - 1) return STAGES[i + 1];
+    if (s.d > 0) return STAGES[i];
+  }
+  return STAGES[0];
+}
 
-  const stHTML = stagesData.map(st => {
-    const secsHTML = st.secs.map(sec => {
-      const itemsHTML = sec.items.map(i => `
-        <tr>
-          <td style="padding:5px 8px;font-size:12px;border-bottom:1px solid #f0ece8">${i.item}</td>
-          <td style="padding:5px 8px;text-align:center;font-size:13px;border-bottom:1px solid #f0ece8;color:${i.done ? "#1B7A3E" : "#999"}">${i.done ? "✓" : "○"}</td>
-          <td style="padding:5px 8px;font-size:11px;border-bottom:1px solid #f0ece8;color:#666">${i.date || "—"}</td>
-          <td style="padding:5px 8px;font-size:11px;border-bottom:1px solid #f0ece8;color:#666">${i.note || ""}</td>
-        </tr>`).join("");
+// ─── EXPORT: HTML/PDF — TODOS LOS ROVERS, DISEÑO DINÁMICO ─────────────────────
+function exportAllHTML(scouts, prog, dates, attendance) {
+  const today = new Date().toLocaleDateString("es-GT", { day: "2-digit", month: "long", year: "numeric" });
+
+  const clanD = scouts.reduce((a, sc) => a + scoutTotalStats(sc, prog).d, 0);
+  const clanT = scouts.reduce((a, sc) => a + scoutTotalStats(sc, prog).t, 0);
+  const clanPct = clanT ? Math.round(clanD / clanT * 100) : 0;
+
+  const cards = scouts.map(sc => {
+    const tot = scoutTotalStats(sc, prog);
+    const cs  = scoutCurrentStage(sc, prog);
+    const att = scoutAttendanceStats(sc, attendance);
+
+    const stageBars = STAGES.map(st => {
+      const s = scoutStageStats(sc, st, prog);
       return `
-        <div style="margin-bottom:12px">
-          <div style="background:#f7f3ef;padding:5px 10px;font-weight:700;font-size:12px;border-left:3px solid ${st.color};color:#2a1208">
-            ${sec.name} — ${sec.d}/${sec.t}
+        <div style="margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:#6B5644;margin-bottom:3px">
+            <span style="font-weight:700;color:${st.color}">${st.numeral} · ${st.name}</span>
+            <span>${s.d}/${s.t} · ${s.pct}%</span>
           </div>
-          <table style="width:100%;border-collapse:collapse">
-            <thead><tr style="background:#fafaf8">
-              <th style="text-align:left;padding:4px 8px;font-size:11px;color:#888;font-weight:600">Requisito</th>
-              <th style="padding:4px 8px;font-size:11px;color:#888;font-weight:600;width:55px">Estado</th>
-              <th style="text-align:left;padding:4px 8px;font-size:11px;color:#888;font-weight:600;width:100px">Fecha</th>
-              <th style="text-align:left;padding:4px 8px;font-size:11px;color:#888;font-weight:600">Observaciones</th>
-            </tr></thead>
-            <tbody>${itemsHTML}</tbody>
-          </table>
+          <div style="height:7px;background:#EFE8DD;border-radius:4px;overflow:hidden">
+            <div style="height:100%;width:${s.pct}%;background:${st.color};border-radius:4px"></div>
+          </div>
         </div>`;
     }).join("");
+
+    const attBlock = att.t ? `
+      <div style="margin-top:10px;padding-top:10px;border-top:1px dashed #E0D5C5;display:flex;gap:10px;font-size:11px;color:#6B5644;flex-wrap:wrap">
+        <span>📋 Asistencia: <strong style="color:#2E6E8E">${att.pct}%</strong></span>
+        <span style="color:#1B7A3E">✓ ${att.p}</span>
+        <span style="color:#C0392B">✕ ${att.a}</span>
+        <span style="color:#B9770E">⚠ ${att.e}</span>
+        <span>Total: ${att.t}</span>
+      </div>` : "";
+
     return `
-      <div style="margin-bottom:28px;page-break-inside:avoid">
-        <div style="background:${st.color};color:#fff;padding:9px 14px;border-radius:6px 6px 0 0;display:flex;justify-content:space-between;align-items:center">
-          <span style="font-size:15px;font-weight:700">${st.numeral} · ${st.name}</span>
-          <span style="font-size:13px;font-weight:600">${st.pct}% — ${st.d}/${st.t} req.</span>
+      <div style="background:#fff;border:1px solid #EAE0D2;border-radius:14px;padding:18px 20px;
+        margin-bottom:16px;page-break-inside:avoid;box-shadow:0 1px 3px rgba(0,0,0,0.04)">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px;flex-wrap:wrap;gap:8px">
+          <div style="display:flex;align-items:center;gap:12px">
+            <div style="width:44px;height:44px;border-radius:50%;background:${cs.color};color:#fff;
+              display:flex;align-items:center;justify-content:center;font-family:Georgia,serif;
+              font-size:18px;font-weight:700;flex-shrink:0">${(sc.name||"?")[0].toUpperCase()}</div>
+            <div>
+              <div style="font-size:16px;font-weight:700;color:#241008">${sc.name}</div>
+              <div style="font-size:11.5px;color:${cs.color};font-weight:600">${cs.name} — ${cs.subtitle}</div>
+              ${sc.group ? `<div style="font-size:11px;color:#9A7A60">${sc.group}</div>` : ""}
+            </div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:26px;font-weight:700;color:#C0392B;font-family:Georgia,serif;line-height:1">${tot.pct}%</div>
+            <div style="font-size:10.5px;color:#9A7A60">${tot.d}/${tot.t} requisitos</div>
+          </div>
         </div>
-        <div style="border:1px solid #e0d8d0;border-top:none;border-radius:0 0 6px 6px;padding:14px">${secsHTML}</div>
+        ${stageBars}
+        ${attBlock}
       </div>`;
   }).join("");
 
-  // Asistencia: filtrar registros de este scout, ordenar por fecha
-  const attRecords = Object.entries(attendance || {})
-    .filter(([k]) => k.startsWith(`att:${scout.id}|`))
-    .map(([k, v]) => ({ date: k.split("|")[1], status: v.status, note: v.note || "" }))
-    .sort((a, b) => a.date.localeCompare(b.date));
-  const attTotal = attRecords.length;
-  const attP = attRecords.filter(r => r.status === "presente").length;
-  const attA = attRecords.filter(r => r.status === "ausente").length;
-  const attE = attRecords.filter(r => r.status === "excusa").length;
-  const attPct = attTotal ? Math.round(attP / attTotal * 100) : 0;
-  const attHTML = attTotal ? `
-    <div style="margin-bottom:28px;page-break-inside:avoid">
-      <div style="background:#2a1208;color:#fff;padding:9px 14px;border-radius:6px 6px 0 0;display:flex;justify-content:space-between;align-items:center">
-        <span style="font-size:15px;font-weight:700">📋 Asistencia a Reuniones</span>
-        <span style="font-size:13px;font-weight:600">${attPct}% asistencia — ${attP}/${attTotal}</span>
-      </div>
-      <div style="border:1px solid #e0d8d0;border-top:none;border-radius:0 0 6px 6px;padding:14px">
-        <div style="display:flex;gap:14px;margin-bottom:12px;font-size:12px;color:#555">
-          <span>✓ Presente: <strong style="color:#1B7A3E">${attP}</strong></span>
-          <span>✕ Ausente: <strong style="color:#C0392B">${attA}</strong></span>
-          <span>⚠ Excusa: <strong style="color:#B9770E">${attE}</strong></span>
-          <span>Total reuniones: <strong>${attTotal}</strong></span>
-        </div>
-        <table style="width:100%;border-collapse:collapse">
-          <thead><tr style="background:#fafaf8">
-            <th style="text-align:left;padding:4px 8px;font-size:11px;color:#888;font-weight:600;width:100px">Fecha</th>
-            <th style="padding:4px 8px;font-size:11px;color:#888;font-weight:600;width:90px">Estado</th>
-            <th style="text-align:left;padding:4px 8px;font-size:11px;color:#888;font-weight:600">Observaciones</th>
-          </tr></thead>
-          <tbody>${attRecords.map(r => {
-            const st = ATT_STATES[r.status] || { label: r.status, color: "#999" };
-            return `
-            <tr>
-              <td style="padding:5px 8px;font-size:12px;border-bottom:1px solid #f0ece8">${r.date}</td>
-              <td style="padding:5px 8px;text-align:center;font-size:11px;border-bottom:1px solid #f0ece8;color:${st.color};font-weight:600">${st.label}</td>
-              <td style="padding:5px 8px;font-size:11px;border-bottom:1px solid #f0ece8;color:#666">${r.note || ""}</td>
-            </tr>`;
-          }).join("")}</tbody>
-        </table>
-      </div>
-    </div>` : `
-    <div style="margin-bottom:28px;padding:14px;background:#f9f5f0;border:1px solid #e0d0c0;border-radius:6px;font-size:12px;color:#9a7a60;text-align:center">
-      Sin registros de asistencia aún
-    </div>`;
-
-  const html = `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
-<title>Progresión Rover – ${scout.name}</title>
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
+<title>Progresión Rover — Clan</title>
 <style>
-body{font-family:Georgia,serif;max-width:960px;margin:0 auto;padding:32px;color:#1a0a04;background:#fffdf8;font-size:13px}
-@media print{body{padding:10px}button{display:none!important}@page{margin:1.5cm}}
-h1{color:#C0392B;font-size:22px;margin:0 0 4px}
+  * { box-sizing:border-box; }
+  body{font-family:'Helvetica Neue',Arial,sans-serif;max-width:880px;margin:0 auto;
+    padding:28px 20px 50px;color:#241008;background:#FAF6F0;font-size:13px}
+  @media print{ body{padding:6px;background:#fff} .noprint{display:none!important} @page{margin:1.2cm} }
+  @media (max-width:600px){ body{padding:14px} }
 </style></head><body>
-<div style="text-align:center;border-bottom:2px solid #C0392B;padding-bottom:20px;margin-bottom:28px">
-  <div style="font-size:32px;color:#C0392B;margin-bottom:6px">⚜ PROGRESIÓN ROVER</div>
-  <div style="font-size:20px;font-weight:700;color:#2a1208">${scout.name}${scout.group ? " · " + scout.group : ""}</div>
-  <div style="font-size:13px;color:#7a5a40;margin-top:8px">
-    Progreso Total: <strong style="color:#C0392B">${pct}%</strong> &nbsp;(${totalD} / ${totalT} requisitos) &nbsp;·&nbsp; Asistencia: <strong style="color:#C0392B">${attPct}%</strong> &nbsp;·&nbsp; Generado: ${today}
-  </div>
-  <div style="margin-top:14px">
-    <div style="height:8px;background:#f0e8e0;border-radius:4px;overflow:hidden;max-width:400px;margin:0 auto">
-      <div style="height:100%;width:${pct}%;background:linear-gradient(90deg,#8B1A1A,#C0392B);border-radius:4px"></div>
-    </div>
-  </div>
-  <button onclick="window.print()" style="margin-top:14px;padding:7px 20px;background:#C0392B;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px">🖨️ Imprimir / Guardar como PDF</button>
+
+<div style="text-align:center;margin-bottom:26px">
+  <div style="font-size:13px;letter-spacing:3px;color:#B9770E;font-weight:700;margin-bottom:4px">CARTILLA 2.0 · GUATEMALA</div>
+  <div style="font-size:28px;font-weight:700;color:#8B1A1A;font-family:Georgia,serif">⚜ Progresión del Clan</div>
+  <div style="font-size:12.5px;color:#7A5A40;margin-top:6px">${scouts.length} Rover${scouts.length===1?"":"s"} registrado${scouts.length===1?"":"s"} · Generado el ${today}</div>
 </div>
-${attHTML}
-${stHTML}
-<div style="margin-top:32px;padding:12px;background:#f9f5f0;border:1px solid #e0d0c0;border-radius:5px;font-size:11px;color:#9a7a60;text-align:center">
-  Cartilla 2.0 · Progresión Rover · Asociación de Scouts de Guatemala · ${today}
+
+<div style="display:flex;gap:14px;margin-bottom:24px;flex-wrap:wrap">
+  <div style="flex:1;min-width:140px;background:linear-gradient(135deg,#8B1A1A,#C0392B);border-radius:14px;
+    padding:16px 18px;color:#fff">
+    <div style="font-size:30px;font-weight:700;font-family:Georgia,serif">${clanPct}%</div>
+    <div style="font-size:11px;opacity:.9">Progreso promedio del Clan</div>
+  </div>
+  <div style="flex:1;min-width:140px;background:#fff;border:1px solid #EAE0D2;border-radius:14px;padding:16px 18px">
+    <div style="font-size:30px;font-weight:700;color:#241008;font-family:Georgia,serif">${scouts.length}</div>
+    <div style="font-size:11px;color:#9A7A60">Total de Rovers</div>
+  </div>
+  <div style="flex:1;min-width:140px;background:#fff;border:1px solid #EAE0D2;border-radius:14px;padding:16px 18px">
+    <div style="font-size:30px;font-weight:700;color:#241008;font-family:Georgia,serif">${clanD}/${clanT}</div>
+    <div style="font-size:11px;color:#9A7A60">Requisitos completados</div>
+  </div>
+</div>
+
+<button class="noprint" onclick="window.print()" style="display:block;margin:0 auto 24px;padding:9px 24px;
+  background:#C0392B;color:#fff;border:none;border-radius:7px;cursor:pointer;font-size:13px;font-weight:600">
+  🖨️ Imprimir / Guardar como PDF
+</button>
+
+${cards}
+
+<div style="margin-top:30px;padding:12px;text-align:center;font-size:10.5px;color:#9A7A60">
+  Cartilla 2.0 · Progresión Rover · Generado el ${today}
 </div>
 </body></html>`;
-  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `Reporte_Rover_${scout.name.replace(/\s+/g,"_")}.html`;
-  a.click();
 }
 
-function exportCSV(scout, prog, dates, notes) {
-  const rows = [["Rover","Grupo/Clan","Etapa","Sección","Área","Requisito","Completado","Fecha","Observaciones"]];
-  STAGES.forEach(st => st.sections.forEach(sec => sec.items.forEach((item, idx) => {
-    rows.push([
-      scout.name, scout.group || "",
-      st.name, sec.name, sec.area, item,
-      prog[pKey(scout.id, st.id, sec.name, idx)] ? "Sí" : "No",
-      dates[dKey(scout.id, st.id, sec.name, idx)] || "",
-      (notes[nKey(scout.id, st.id, sec.name, idx)] || "").replace(/"/g,'""')
-    ]);
-  })));
-  const csv = rows.map(r => r.map(c => `"${c}"`).join(",")).join("\n");
-  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `Progresion_${scout.name.replace(/\s+/g,"_")}.csv`;
-  a.click();
-}
-
-function exportAttendanceCSV(scout, attendance) {
-  const rows = [["Rover","Grupo/Clan","Fecha","Estado","Observaciones"]];
-  Object.entries(attendance || {})
-    .filter(([k]) => k.startsWith(`att:${scout.id}|`))
-    .map(([k, v]) => ({ date: k.split("|")[1], status: v.status, note: v.note || "" }))
-    .sort((a, b) => a.date.localeCompare(b.date))
-    .forEach(r => {
+// ─── EXPORT: CSV — TODOS LOS ROVERS, PROGRESIÓN COMPLETA ──────────────────────
+function exportAllCSV(scouts, prog, dates) {
+  const rows = [["Rover","Grupo/Clan","Etapa","Sección","Área","Requisito","Completado","Fecha"]];
+  scouts.forEach(scout => {
+    STAGES.forEach(st => st.sections.forEach(sec => sec.items.forEach((item, idx) => {
       rows.push([
-        scout.name, scout.group || "", r.date,
-        (ATT_STATES[r.status] || {}).label || r.status,
-        r.note.replace(/"/g,'""')
+        scout.name, scout.group || "",
+        st.name, sec.name, sec.area, item,
+        prog[pKey(scout.id, st.id, sec.name, idx)] ? "Sí" : "No",
+        dates[dKey(scout.id, st.id, sec.name, idx)] || ""
       ]);
-    });
-  const csv = rows.map(r => r.map(c => `"${c}"`).join(",")).join("\n");
+    })));
+  });
+  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
   const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `Asistencia_${scout.name.replace(/\s+/g,"_")}.csv`;
+  a.download = `Progresion_Clan_${new Date().toISOString().split("T")[0]}.csv`;
   a.click();
 }
 
-// ─── CSS ─────────────────────────────────────────────────────────────────────
+// ─── EXPORT: CSV — ASISTENCIA DE TODOS LOS ROVERS ─────────────────────────────
+function exportAllAttendanceCSV(scouts, attendance) {
+  const rows = [["Rover","Grupo/Clan","Fecha","Estado","Observaciones"]];
+  scouts.forEach(scout => {
+    Object.entries(attendance || {})
+      .filter(([k]) => k.startsWith(`att:${scout.id}|`))
+      .map(([k, v]) => ({ date: k.split("|")[1], status: v.status, note: v.note || "" }))
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .forEach(r => {
+        rows.push([
+          scout.name, scout.group || "", r.date,
+          (ATT_STATES[r.status] || {}).label || r.status,
+          r.note
+        ]);
+      });
+  });
+  const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `Asistencia_Clan_${new Date().toISOString().split("T")[0]}.csv`;
+  a.click();
+}
+
+// ─── ESTILOS GLOBALES ──────────────────────────────────────────────────────────
 const CSS = `
-@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Source+Sans+3:wght@400;500;600;700&display=swap');
-*{box-sizing:border-box;margin:0;padding:0}
-::-webkit-scrollbar{width:4px;height:4px}
-::-webkit-scrollbar-thumb{background:#2A1208;border-radius:2px}
-.fade-in{animation:fi 0.22s ease}
-@keyframes fi{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
-.scout-row:hover{background:rgba(30,14,5,0.99)!important}
-.stage-card{transition:transform 0.18s,box-shadow 0.18s;cursor:pointer}
-.stage-card:hover{transform:translateY(-3px);box-shadow:0 10px 32px rgba(0,0,0,0.65)}
-.check-row:hover{background:rgba(255,255,255,0.025)!important}
-.add-btn:hover{background:rgba(139,26,26,0.28)!important}
-.del-btn:hover{color:#D63031!important}
-.back-btn:hover{color:#D63031!important}
-.stab:hover{opacity:0.8}
-.expbtn:hover{opacity:0.7}
-.sec-hdr:hover{background:rgba(255,255,255,0.025)!important}
-input[type=date]{color-scheme:dark;font-family:'Source Sans 3',sans-serif}
-input[type=date]::-webkit-calendar-picker-indicator{filter:invert(0.45) sepia(1) saturate(1.2) hue-rotate(330deg);cursor:pointer;opacity:0.8}
-.di{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:4px;padding:2px 6px;color:#B8A898;font-size:11px;outline:none;width:118px}
-.di:focus{border-color:rgba(201,162,39,0.4)}
-.ni{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);border-radius:5px;padding:4px 7px;color:#C0B0A0;font-size:12px;outline:none;width:100%;resize:none}
-.ni:focus{border-color:rgba(201,162,39,0.3)}
-.ebtn:hover{background:rgba(201,162,39,0.18)!important}
+@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Source+Sans+3:wght@400;500;600;700&display=swap');
+* { box-sizing: border-box; }
+body { margin:0; }
+.rv-root { font-family:'Source Sans 3',sans-serif; }
+::-webkit-scrollbar { width:7px; height:7px; }
+::-webkit-scrollbar-thumb { background:rgba(201,162,39,0.25); border-radius:4px; }
+::-webkit-scrollbar-track { background:transparent; }
+.fade-in { animation: fadeIn 0.25s ease; }
+@keyframes fadeIn { from{opacity:0; transform:translateY(3px);} to{opacity:1; transform:translateY(0);} }
+input, textarea, select, button { font-family:inherit; }
+.ni { background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); border-radius:5px;
+  color:#EDE8E1; outline:none; font-size:12px; }
+.ni:focus { border-color:rgba(201,162,39,0.4); }
+.di { background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.1); border-radius:5px;
+  color:#EDE8E1; outline:none; font-size:12px; padding:4px 7px; color-scheme:dark; }
+.add-btn:hover { background:rgba(139,26,26,0.22)!important; }
+.del-btn:hover { color:#D63031!important; }
+.scout-row:hover { background:rgba(28,13,5,0.8)!important; }
+.sec-hdr:hover { background:rgba(255,255,255,0.02); }
+.check-row:hover { background:rgba(255,255,255,0.025); border-color:rgba(255,255,255,0.05)!important; }
+.expbtn:hover { color:#C9A227!important; }
+.stab:hover { opacity:0.82; }
+.ebtn:hover { background:rgba(201,162,39,0.18)!important; }
 .att-nav:hover{background:rgba(91,143,168,0.2)!important}
 .att-cell:hover{transform:scale(1.18)}
+.move-btn:hover{background:rgba(201,162,39,0.18)!important}
+.login-input:focus{border-color:rgba(201,162,39,0.5)!important}
+.login-btn:hover{background:#A52E27!important}
+.viewer-badge{ }
+.hamburger:hover{background:rgba(255,255,255,0.06)!important}
+
+/* ── RESPONSIVE: tablet ── */
+@media (max-width: 980px) {
+  .rv-sidebar { width:180px!important; }
+}
+
+/* ── RESPONSIVE: móvil ── */
+@media (max-width: 700px) {
+  .hamburger { display:flex!important; align-items:center; justify-content:center; }
+  .rv-edit-badge { display:none!important; }
+  .rv-header { padding:8px 12px!important; flex-wrap:wrap; gap:8px!important; }
+  .rv-header-title { font-size:11px!important; letter-spacing:1.5px!important; }
+  .rv-header-sub { display:none!important; }
+  .rv-body { flex-direction:column!important; position:relative; }
+  .rv-overlay {
+    display:block!important; position:absolute; inset:0; z-index:40;
+    background:rgba(0,0,0,0.55);
+  }
+  .rv-sidebar {
+    position:absolute!important; top:0; left:0; z-index:50;
+    width:84%!important; max-width:300px; height:100%;
+    box-shadow:6px 0 24px rgba(0,0,0,0.5);
+    transform:translateX(-105%); transition:transform 0.2s ease;
+  }
+  .rv-sidebar.open-mobile { transform:translateX(0); }
+  .rv-main { padding-bottom:30px; width:100%; }
+  .ov-grid { grid-template-columns:repeat(2,1fr)!important; }
+  .att-table-wrap { font-size:9px!important; }
+  .radar-svg-wrap { max-width:260px!important; }
+  .rv-overview-pad { padding:14px!important; }
+  .rv-detail-pad { padding:12px 14px!important; }
+}
+@media (max-width: 420px) {
+  .ov-grid { grid-template-columns:1fr 1fr!important; gap:8px!important; }
+}
 `;
 
+// ─── PANTALLA DE LOGIN (solo para administrador) ──────────────────────────────
+function LoginScreen({ onClose }) {
+  const [email, setEmail] = useState("");
+  const [pass, setPass] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
 
-// ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setErr(""); setBusy(true);
+    try {
+      await signInWithEmailAndPassword(auth, email.trim(), pass);
+      onClose();
+    } catch (ex) {
+      setErr("Correo o contraseña incorrectos.");
+    }
+    setBusy(false);
+  };
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(5,2,1,0.85)",
+      display:"flex", alignItems:"center", justifyContent:"center", zIndex:1000,
+      padding:"16px" }} onClick={onClose}>
+      <form onClick={e => e.stopPropagation()} onSubmit={handleLogin}
+        style={{ background:"#150B05", border:"1px solid rgba(201,162,39,0.25)",
+          borderRadius:"14px", padding:"28px 26px", width:"100%", maxWidth:"340px",
+          display:"flex", flexDirection:"column", gap:"12px" }}>
+        <div style={{ textAlign:"center", marginBottom:"6px" }}>
+          <div style={{ fontSize:"30px", color:"#D63031" }}>⚜</div>
+          <div style={{ fontFamily:"'Cinzel',serif", fontSize:"15px", fontWeight:"700",
+            color:"#EDE8E1", marginTop:"4px" }}>Acceso de Dirigente</div>
+          <div style={{ fontSize:"11.5px", color:"#9A7A60", marginTop:"3px" }}>
+            Inicia sesión para editar la progresión
+          </div>
+        </div>
+        <input className="login-input" type="email" placeholder="Correo electrónico"
+          value={email} onChange={e => setEmail(e.target.value)} required autoFocus
+          style={{ background:"rgba(255,255,255,0.05)", border:"1px solid rgba(255,255,255,0.12)",
+            borderRadius:"7px", padding:"10px 12px", color:"#EDE8E1", fontSize:"13px", outline:"none" }} />
+        <input className="login-input" type="password" placeholder="Contraseña"
+          value={pass} onChange={e => setPass(e.target.value)} required
+          style={{ background:"rgba(255,255,255,0.05)", border:"1px solid rgba(255,255,255,0.12)",
+            borderRadius:"7px", padding:"10px 12px", color:"#EDE8E1", fontSize:"13px", outline:"none" }} />
+        {err && <div style={{ fontSize:"12px", color:"#E74C3C" }}>{err}</div>}
+        <button className="login-btn" type="submit" disabled={busy}
+          style={{ marginTop:"4px", padding:"10px", background:"#8B1A1A", border:"none",
+            borderRadius:"7px", color:"#fff", fontSize:"14px", fontWeight:"700",
+            cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1,
+            transition:"background 0.15s" }}>
+          {busy ? "Ingresando…" : "Ingresar"}
+        </button>
+        <button type="button" onClick={onClose}
+          style={{ background:"none", border:"none", color:"#7A5A40", fontSize:"12px",
+            cursor:"pointer", marginTop:"2px" }}>Cancelar — solo ver</button>
+      </form>
+    </div>
+  );
+}
+
+// ─── DOCUMENTO ÚNICO EN FIRESTORE ─────────────────────────────────────────────
+const DOC_REF = doc(db, "rover_app", "data");
+const EMPTY_DATA = { scouts: [], prog: {}, dates: {}, invDates: {}, attendance: {}, order: [] };
+
 export default function RoverDashboard() {
-  const [scouts, setScouts]     = useState([]);
-  const [selId, setSelId]       = useState(null);
-  const [prog, setProg]         = useState({});
-  const [dates, setDates]       = useState({});
-  const [notes, setNotes]       = useState({});
+  // ── Auth ──
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [showLogin, setShowLogin] = useState(false);
+  const isAdmin = !!user;
+
+  // ── Datos (sincronizados con Firestore) ──
+  const [scouts, setScouts] = useState([]);
+  const [prog, setProg]     = useState({});
+  const [dates, setDates]   = useState({});
   const [invDates, setInvDates] = useState({});
   const [attendance, setAttendance] = useState({});
-  const [view, setView]         = useState("overview"); // overview | detail | radar | attendance
+  const [loading, setLoading] = useState(true);
+  const [saveErr, setSaveErr] = useState(false);
+
+  // ── UI local ──
+  const [selId, setSelId]       = useState(null);
+  const [view, setView]         = useState("overview");
   const [stageId, setStageId]   = useState(1);
   const [adding, setAdding]     = useState(false);
   const [newName, setNewName]   = useState("");
   const [newGroup, setNewGroup] = useState("");
-  const [loading, setLoading]   = useState(true);
   const [expItem, setExpItem]   = useState(null);
   const [exportMenu, setExportMenu] = useState(false);
   const [collapsedSecs, setCollapsedSecs] = useState({});
   const [attMonth, setAttMonth] = useState(() => {
     const n = new Date();
-    return { y: n.getFullYear(), m: n.getMonth() }; // m: 0-11
+    return { y: n.getFullYear(), m: n.getMonth() };
   });
+  const [sidebarOpen, setSidebarOpen] = useState(false); // móvil
 
-  // ── Storage (localStorage del navegador) ────────────────────────────────────
+  const dataRef = useRef(EMPTY_DATA);
+
+  // ── Auth listener ──
   useEffect(() => {
-    try {
-      const load = (k) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } };
-      const s = load("rv4:scouts");
-      const p = load("rv4:prog");
-      const d = load("rv4:dates");
-      const n = load("rv4:notes");
-      const iv = load("rv4:inv");
-      const at = load("rv4:att");
-      if (s) { setScouts(s); if (s.length) setSelId(s[0].id); }
-      if (p) setProg(p);
-      if (d) setDates(d);
-      if (n) setNotes(n);
-      if (iv) setInvDates(iv);
-      if (at) setAttendance(at);
-    } catch {}
-    setLoading(false);
+    const unsub = onAuthStateChanged(auth, (u) => { setUser(u); setAuthReady(true); });
+    return unsub;
   }, []);
 
-  const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
-  const saveScouts = (v) => { setScouts(v); save("rv4:scouts", v); };
-  const saveProg   = (v) => { setProg(v);   save("rv4:prog", v); };
-  const saveDates  = (v) => { setDates(v);  save("rv4:dates", v); };
-  const saveNotes  = (v) => { setNotes(v);  save("rv4:notes", v); };
-  const saveInv    = (v) => { setInvDates(v); save("rv4:inv", v); };
-  const saveAtt    = (v) => { setAttendance(v); save("rv4:att", v); };
+  // ── Firestore: escucha en tiempo real ──
+  useEffect(() => {
+    const unsub = onSnapshot(DOC_REF,
+      (snap) => {
+        const d = snap.exists() ? snap.data() : EMPTY_DATA;
+        const merged = { ...EMPTY_DATA, ...d };
+        dataRef.current = merged;
+        setScouts(merged.scouts || []);
+        setProg(merged.prog || {});
+        setDates(merged.dates || {});
+        setInvDates(merged.invDates || {});
+        setAttendance(merged.attendance || {});
+        setLoading(false);
+        setSaveErr(false);
+        if (!selId && (merged.scouts || []).length) setSelId(merged.scouts[0].id);
+      },
+      (error) => { setLoading(false); setSaveErr(true); }
+    );
+    return unsub;
+  }, []);
 
-  // ── Handlers ──────────────────────────────────────────────────────────────
+  // ── Guardado: persiste el documento en Firestore (merge para evitar pérdidas) ──
+  const persist = async (patch) => {
+    const next = { ...dataRef.current, ...patch };
+    dataRef.current = next;
+    try {
+      await setDoc(DOC_REF, next, { merge: true });
+      setSaveErr(false);
+    } catch (e) {
+      setSaveErr(true);
+    }
+  };
+  const saveScouts = (v) => { setScouts(v); persist({ scouts: v }); };
+  const saveProg   = (v) => { setProg(v);   persist({ prog: v }); };
+  const saveDates  = (v) => { setDates(v);  persist({ dates: v }); };
+  const saveInv    = (v) => { setInvDates(v); persist({ invDates: v }); };
+  const saveAtt    = (v) => { setAttendance(v); persist({ attendance: v }); };
+
+  // ── Scouts CRUD (solo admin) ──
   const addScout = () => {
-    if (!newName.trim()) return;
-    const sc = { id: `r${Date.now()}`, name: newName.trim(), group: newGroup.trim() };
+    if (!isAdmin || !newName.trim()) return;
+    const sc = { id: Date.now().toString(36) + Math.random().toString(36).slice(2,6), name: newName.trim(), group: newGroup.trim() };
     const upd = [...scouts, sc];
-    saveScouts(upd); setSelId(sc.id); setNewName(""); setNewGroup(""); setAdding(false);
+    saveScouts(upd);
+    setSelId(sc.id); setNewName(""); setNewGroup(""); setAdding(false);
   };
   const deleteScout = (id) => {
+    if (!isAdmin) return;
     const upd = scouts.filter(s => s.id !== id);
     saveScouts(upd); if (selId === id) setSelId(upd[0]?.id || null);
     const na = { ...attendance };
     Object.keys(na).forEach(k => { if (k.startsWith(`att:${id}|`)) delete na[k]; });
     saveAtt(na);
   };
+  const moveScout = (id, dir) => {
+    if (!isAdmin) return;
+    const i = scouts.findIndex(s => s.id === id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= scouts.length) return;
+    const upd = [...scouts];
+    [upd[i], upd[j]] = [upd[j], upd[i]];
+    saveScouts(upd);
+  };
+
+  // ── Progresión ──
   const toggleItem = (stId, sec, idx) => {
-    if (!selId) return;
+    if (!isAdmin || !selId) return;
     const k = pKey(selId, stId, sec, idx);
-    const np = { ...prog, [k]: !prog[k] };
-    if (np[k] && !dates[dKey(selId, stId, sec, idx)]) {
-      saveDates({ ...dates, [dKey(selId, stId, sec, idx)]: new Date().toISOString().split("T")[0] });
-    }
-    saveProg(np);
+    const now = !prog[k];
+    const np = { ...prog, [k]: now };
+    const ndt = { ...dates };
+    const dk = dKey(selId, stId, sec, idx);
+    if (now && !ndt[dk]) ndt[dk] = new Date().toISOString().split("T")[0];
+    saveProg(np); saveDates(ndt);
   };
   const setItemDate = (stId, sec, idx, val) => {
-    if (!selId) return;
+    if (!isAdmin || !selId) return;
     saveDates({ ...dates, [dKey(selId, stId, sec, idx)]: val });
   };
-  const setItemNote = (stId, sec, idx, val) => {
-    if (!selId) return;
-    saveNotes({ ...notes, [nKey(selId, stId, sec, idx)]: val });
-  };
-  const setInvDate = (stId, val) => {
-    if (!selId) return;
-    saveInv({ ...invDates, [invKey(selId, stId)]: val });
+  const toggleInv = (stId) => {
+    if (!isAdmin || !selId) return;
+    const k = invKey(selId, stId);
+    saveInv({ ...invDates, [k]: invDates[k] ? "" : new Date().toISOString().split("T")[0] });
   };
   const toggleSec = (key) => setCollapsedSecs(p => ({ ...p, [key]: !p[key] }));
 
-  // ── Asistencia ────────────────────────────────────────────────────────────
+  // ── Asistencia (solo admin marca; todos ven) ──
   const cycleAttStatus = (scoutId, date) => {
+    if (!isAdmin) return;
     const k = attKey(scoutId, date);
     const curr = attendance[k];
     if (!curr) { saveAtt({ ...attendance, [k]: { status: "presente", note: "" } }); return; }
     const idx = ATT_CYCLE.indexOf(curr.status);
     if (idx === ATT_CYCLE.length - 1) {
-      // último estado del ciclo -> limpiar día (vuelve a "sin marcar")
       const na = { ...attendance };
       delete na[k];
       saveAtt(na);
@@ -551,22 +707,25 @@ export default function RoverDashboard() {
     }
   };
 
-  // ── Stats ─────────────────────────────────────────────────────────────────
+  // ── Stats helpers (atados a este componente) ──
   const stageStats = (scoutId, stage) => {
     let t = 0, d = 0;
     stage.sections.forEach(sec => sec.items.forEach((_, i) => {
       t++; if (prog[pKey(scoutId, stage.id, sec.name, i)]) d++;
     }));
-    return { d, t, pct: t ? Math.round(d / t * 100) : 0 };
+    return { t, d, pct: t ? Math.round(d / t * 100) : 0 };
   };
   const totalStats = (scoutId) => {
     let t = 0, d = 0;
     STAGES.forEach(st => { const s = stageStats(scoutId, st); t += s.t; d += s.d; });
-    return { d, t, pct: t ? Math.round(d / t * 100) : 0 };
+    return { t, d, pct: t ? Math.round(d / t * 100) : 0 };
   };
   const getCurrStage = (scoutId) => {
-    for (let i = STAGES.length - 1; i >= 0; i--)
-      if (stageStats(scoutId, STAGES[i]).d > 0) return STAGES[i];
+    for (let i = STAGES.length - 1; i >= 0; i--) {
+      const s = stageStats(scoutId, STAGES[i]);
+      if (s.pct === 100 && i < STAGES.length - 1) return STAGES[i + 1];
+      if (s.d > 0) return STAGES[i];
+    }
     return STAGES[0];
   };
   const areaScore = (scoutId, stage, area) => {
@@ -591,36 +750,44 @@ export default function RoverDashboard() {
     return { t, p, a, e, pct: t ? Math.round(p / t * 100) : 0 };
   };
 
-  const selScout  = scouts.find(s => s.id === selId);
-  const activeSt  = STAGES.find(s => s.id === stageId) || STAGES[0];
-  const totStats  = selId ? totalStats(selId) : null;
-  const currStage = selId ? getCurrStage(selId) : STAGES[0];
+  const selScout = scouts.find(s => s.id === selId) || null;
+  const activeSt = STAGES.find(s => s.id === stageId) || STAGES[0];
+  const totStats = selScout ? totalStats(selId) : { t:0, d:0, pct:0 };
 
-  // ── Loading ───────────────────────────────────────────────────────────────
-  if (loading) return (
-    <div style={{ background:"#0A0604", height:"100vh", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:"16px" }}>
-      <style>{`@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}`}</style>
-      <div style={{ fontSize:"48px", animation:"spin 3s linear infinite", color:"#D63031" }}>⚜</div>
-      <div style={{ color:"#7A5A40", fontFamily:"'Cinzel',serif", letterSpacing:"4px", fontSize:"12px" }}>CARGANDO...</div>
-    </div>
-  );
+  if (loading || !authReady) {
+    return (
+      <div className="rv-root" style={{ minHeight:"100vh", background:"#0A0604",
+        display:"flex", alignItems:"center", justifyContent:"center" }}>
+        <style>{CSS}</style>
+        <div style={{ textAlign:"center" }}>
+          <div style={{ fontSize:"40px", color:"#D63031", opacity:.4 }}>⚜</div>
+          <div style={{ fontSize:"12px", color:"#7A5A40", marginTop:"8px",
+            fontFamily:"'Source Sans 3',sans-serif" }}>Cargando progresión…</div>
+        </div>
+      </div>
+    );
+  }
 
-  // ─────────────────────────────────────────────────────────────────────────
   return (
-    <div style={{ display:"flex", flexDirection:"column", height:"100vh", background:"#0A0604",
-      fontFamily:"'Source Sans 3',sans-serif", color:"#EDE8E1", overflow:"hidden" }}>
+    <div className="rv-root" style={{ height:"100vh", display:"flex", flexDirection:"column",
+      background:"#0A0604", color:"#EDE8E1", overflow:"hidden" }}>
       <style>{CSS}</style>
+      {showLogin && <LoginScreen onClose={() => setShowLogin(false)} />}
 
-      {/* ══ HEADER ══════════════════════════════════════════════════════════ */}
-      <header style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
-        padding:"9px 16px", background:"linear-gradient(90deg,#0E0804,#130B06)",
-        borderBottom:"1px solid rgba(201,162,39,0.12)", flexShrink:0, gap:"12px", flexWrap:"wrap" }}>
-        <div style={{ display:"flex", alignItems:"center", gap:"11px" }}>
-          <span style={{ fontSize:"24px", color:"#D63031", lineHeight:1 }}>⚜</span>
-          <div>
-            <div style={{ fontFamily:"'Cinzel',serif", fontSize:"14px", fontWeight:"700",
-              letterSpacing:"2.5px", color:"#F0ECE8" }}>PROGRESIÓN ROVER</div>
-            <div style={{ fontSize:"11px", color:"#7A5A40", letterSpacing:"1.5px",
+      {/* ── HEADER ─────────────────────────────────────────────────────────── */}
+      <header className="rv-header" style={{ display:"flex", alignItems:"center",
+        justifyContent:"space-between", padding:"10px 18px",
+        borderBottom:"1px solid rgba(201,162,39,0.1)", flexShrink:0, gap:"10px" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:"11px", minWidth:0 }}>
+          <button className="hamburger" onClick={() => setSidebarOpen(o => !o)}
+            style={{ display:"none", background:"none", border:"1px solid rgba(255,255,255,0.1)",
+              borderRadius:"6px", color:"#C9A227", width:"30px", height:"30px",
+              cursor:"pointer", fontSize:"14px", flexShrink:0 }}>☰</button>
+          <span style={{ fontSize:"24px", color:"#D63031", lineHeight:1, flexShrink:0 }}>⚜</span>
+          <div style={{ minWidth:0 }}>
+            <div className="rv-header-title" style={{ fontFamily:"'Cinzel',serif", fontSize:"14px", fontWeight:"700",
+              letterSpacing:"2.5px", color:"#F0ECE8", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis" }}>PROGRESIÓN ROVER</div>
+            <div className="rv-header-sub" style={{ fontSize:"11px", color:"#7A5A40", letterSpacing:"1.5px",
               fontFamily:"'Source Sans 3',sans-serif" }}>CARTILLA 2.0 · GUATEMALA</div>
           </div>
           <button onClick={() => setView("attendance")}
@@ -628,94 +795,79 @@ export default function RoverDashboard() {
               background: view === "attendance" ? "rgba(91,143,168,0.22)" : "rgba(91,143,168,0.1)",
               border:"1px solid rgba(91,143,168,0.35)", borderRadius:"7px",
               color:"#7FB3D5", fontSize:"12px", fontWeight:"600", cursor:"pointer",
-              fontFamily:"'Source Sans 3',sans-serif", display:"flex",
-              alignItems:"center", gap:"6px", transition:"background 0.15s" }}>
-            📋 Asistencia
+              fontFamily:"'Source Sans 3',sans-serif", flexShrink:0 }}>
+            📋
           </button>
         </div>
-        <div style={{ display:"flex", alignItems:"center", gap:"10px", flexWrap:"wrap", justifyContent:"flex-end" }}>
-          {selScout && totStats && (
-            <>
-              <div style={{ fontFamily:"'Cinzel',serif", fontSize:"13px", color:"#F0ECE8", fontWeight:"600" }}>{selScout.name}</div>
-              {selScout.group && <div style={{ fontSize:"11px", color:"#9A7A60", borderLeft:"1px solid rgba(255,255,255,0.08)", paddingLeft:"8px" }}>{selScout.group}</div>}
-              <div style={{ fontSize:"11px", padding:"2px 9px", borderRadius:"10px",
-                background:`${currStage.color}22`, color:currStage.color,
-                border:`1px solid ${currStage.color}55`, fontWeight:"600" }}>{currStage.name}</div>
-              <div style={{ display:"flex", alignItems:"center", gap:"7px" }}>
-                <div style={{ width:"85px", height:"3px", background:"rgba(255,255,255,0.06)", borderRadius:"2px", overflow:"hidden" }}>
-                  <div style={{ height:"100%", width:`${totStats.pct}%`,
-                    background:"linear-gradient(90deg,#7B0F0F,#D63031)", borderRadius:"2px", transition:"width 0.6s" }} />
-                </div>
-                <span style={{ fontSize:"12px", color:"#9A7A60", fontWeight:"600", minWidth:"34px" }}>{totStats.pct}%</span>
-              </div>
-            </>
+
+        <div style={{ display:"flex", alignItems:"center", gap:"8px", flexShrink:0 }}>
+          {saveErr && (
+            <span style={{ fontSize:"11px", color:"#E74C3C",
+              fontFamily:"'Source Sans 3',sans-serif" }}>⚠ Sin conexión</span>
           )}
-          {selScout && (
-            <div style={{ position:"relative" }}>
-              <button className="ebtn"
-                style={{ padding:"5px 12px", background:"rgba(201,162,39,0.08)",
-                  border:"1px solid rgba(201,162,39,0.28)", borderRadius:"6px", color:"#C9A227",
-                  fontSize:"12px", fontWeight:"600", cursor:"pointer",
-                  fontFamily:"'Source Sans 3',sans-serif", letterSpacing:"0.3px",
-                  display:"flex", alignItems:"center", gap:"5px", transition:"background 0.15s" }}
-                onClick={() => setExportMenu(m => !m)}>
-                ↓ Exportar
-              </button>
-              {exportMenu && (
-                <div className="fade-in" style={{ position:"absolute", right:0, top:"36px",
-                  background:"#130B06", border:"1px solid rgba(201,162,39,0.2)",
-                  borderRadius:"9px", padding:"6px", zIndex:200, minWidth:"260px",
-                  display:"flex", flexDirection:"column", gap:"3px",
-                  boxShadow:"0 10px 36px rgba(0,0,0,0.7)" }}>
-                  <div style={{ fontSize:"9px", color:"#7A5A40", letterSpacing:"1px",
-                    padding:"3px 10px 5px", fontFamily:"'Cinzel',serif" }}>FORMATO</div>
-                  {[
-                    ["📄 Reporte HTML / PDF (progresión + asistencia)", () => { exportHTML(selScout, prog, dates, notes, attendance); setExportMenu(false); }],
-                    ["📊 Excel / CSV — Progresión",        () => { exportCSV(selScout, prog, dates, notes);  setExportMenu(false); }],
-                    ["📋 Excel / CSV — Asistencia",        () => { exportAttendanceCSV(selScout, attendance); setExportMenu(false); }],
-                  ].map(([lbl, fn], i) => (
-                    <button key={i} onClick={fn}
-                      style={{ padding:"7px 12px", background:"transparent", border:"none",
-                        color:"#D8CFC8", fontSize:"13px", cursor:"pointer", textAlign:"left",
-                        borderRadius:"5px", fontFamily:"'Source Sans 3',sans-serif",
-                        transition:"background 0.12s" }}
-                      onMouseEnter={e => e.currentTarget.style.background = "rgba(255,255,255,0.05)"}
-                      onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
-                      {lbl}
-                    </button>
-                  ))}
-                  <div style={{ height:"1px", background:"rgba(255,255,255,0.06)", margin:"3px 2px" }} />
-                  <div style={{ padding:"3px 10px 4px", fontSize:"10px", color:"#5A3A28",
-                    fontFamily:"'Source Sans 3',sans-serif", lineHeight:"1.5" }}>
-                    El reporte HTML incluye asistencia y plan de progresión · botón imprimir/PDF
-                  </div>
-                </div>
-              )}
-            </div>
+          {isAdmin ? (
+            <>
+              <span className="rv-edit-badge" style={{ fontSize:"11px", color:"#27AE60", fontFamily:"'Source Sans 3',sans-serif",
+                display:"flex", alignItems:"center", gap:"4px" }}>
+                <span style={{ width:"6px", height:"6px", borderRadius:"50%", background:"#27AE60" }} />
+                Editando
+              </span>
+              <button onClick={() => signOut(auth)}
+                style={{ padding:"6px 12px", background:"rgba(255,255,255,0.04)",
+                  border:"1px solid rgba(255,255,255,0.1)", borderRadius:"7px",
+                  color:"#9A7A60", fontSize:"12px", cursor:"pointer",
+                  fontFamily:"'Source Sans 3',sans-serif" }}>Salir</button>
+            </>
+          ) : (
+            <button onClick={() => setShowLogin(true)}
+              style={{ padding:"6px 14px", background:"rgba(139,26,26,0.12)",
+                border:"1px solid rgba(139,26,26,0.35)", borderRadius:"7px",
+                color:"#E07A6E", fontSize:"12px", fontWeight:"600", cursor:"pointer",
+                fontFamily:"'Source Sans 3',sans-serif", whiteSpace:"nowrap" }}>🔒 Dirigente</button>
           )}
         </div>
       </header>
 
-      {/* ══ BODY ════════════════════════════════════════════════════════════ */}
-      <div style={{ display:"flex", flex:1, overflow:"hidden" }}>
+      <div className="rv-body" style={{ display:"flex", flex:1, overflow:"hidden" }}>
+
+        {/* Overlay móvil (cierra el sidebar al tocar fuera) */}
+        {sidebarOpen && (
+          <div className="rv-overlay" onClick={() => setSidebarOpen(false)}
+            style={{ display:"none" }} />
+        )}
 
         {/* ── SIDEBAR ─────────────────────────────────────────────────────── */}
-        <aside style={{ width:"218px", flexShrink:0, background:"#0D0704",
+        <aside className={`rv-sidebar${sidebarOpen ? " open-mobile" : ""}`}
+          style={{ width:"218px", flexShrink:0, background:"#0D0704",
           borderRight:"1px solid rgba(201,162,39,0.08)", padding:"10px 8px",
           overflowY:"auto", display:"flex", flexDirection:"column", gap:"5px" }}>
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
             padding:"0 4px 8px", borderBottom:"1px solid rgba(255,255,255,0.04)", marginBottom:"2px" }}>
             <span style={{ fontFamily:"'Cinzel',serif", fontSize:"10px", color:"#7A5A30",
               letterSpacing:"1.5px" }}>ROVERS</span>
-            <button className="add-btn" onClick={() => setAdding(a => !a)}
-              style={{ width:"22px", height:"22px", background:"rgba(139,26,26,0.1)",
-                border:"1px solid rgba(139,26,26,0.3)", borderRadius:"50%", color:"#D63031",
-                fontSize:"16px", lineHeight:1, cursor:"pointer",
-                display:"flex", alignItems:"center", justifyContent:"center",
-                transition:"background 0.15s" }}>+</button>
+            {isAdmin && (
+              <div style={{ display:"flex", gap:"5px" }}>
+                <button className="add-btn" title="Ordenar por % de progreso (mayor a menor)"
+                  onClick={() => {
+                    const upd = [...scouts].sort((a, b) => totalStats(b.id).pct - totalStats(a.id).pct);
+                    saveScouts(upd);
+                  }}
+                  style={{ width:"22px", height:"22px", background:"rgba(201,162,39,0.08)",
+                    border:"1px solid rgba(201,162,39,0.25)", borderRadius:"50%", color:"#C9A227",
+                    fontSize:"11px", lineHeight:1, cursor:"pointer",
+                    display:"flex", alignItems:"center", justifyContent:"center",
+                    transition:"background 0.15s" }}>%</button>
+                <button className="add-btn" onClick={() => setAdding(a => !a)}
+                  style={{ width:"22px", height:"22px", background:"rgba(139,26,26,0.1)",
+                    border:"1px solid rgba(139,26,26,0.3)", borderRadius:"50%", color:"#D63031",
+                    fontSize:"16px", lineHeight:1, cursor:"pointer",
+                    display:"flex", alignItems:"center", justifyContent:"center",
+                    transition:"background 0.15s" }}>+</button>
+              </div>
+            )}
           </div>
 
-          {adding && (
+          {isAdmin && adding && (
             <div className="fade-in" style={{ background:"rgba(20,10,4,0.96)",
               border:"1px solid rgba(201,162,39,0.12)", borderRadius:"8px",
               padding:"10px", marginBottom:"4px" }}>
@@ -752,21 +904,23 @@ export default function RoverDashboard() {
             <div style={{ textAlign:"center", padding:"28px 8px" }}>
               <div style={{ fontSize:"32px", opacity:.15, marginBottom:"8px" }}>⚜</div>
               <div style={{ fontSize:"12px", color:"#5A3A28", lineHeight:"1.6",
-                fontFamily:"'Source Sans 3',sans-serif" }}>Agrega tu primer Rover para comenzar</div>
+                fontFamily:"'Source Sans 3',sans-serif" }}>
+                {isAdmin ? "Agrega tu primer Rover para comenzar" : "Aún no hay Rovers registrados"}
+              </div>
             </div>
           )}
 
-          {scouts.map(sc => {
+          {scouts.map((sc, idx) => {
             const cs = getCurrStage(sc.id);
             const ts = totalStats(sc.id);
             const isSel = sc.id === selId;
             return (
               <div key={sc.id} className="scout-row"
-                style={{ display:"flex", alignItems:"center", gap:"7px", padding:"8px 7px",
+                style={{ display:"flex", alignItems:"center", gap:"6px", padding:"8px 7px",
                   background: isSel ? "rgba(28,13,5,0.99)" : "rgba(16,8,3,0.5)",
                   border:`1px solid ${isSel ? cs.color+"44" : "transparent"}`,
                   borderRadius:"8px", cursor:"pointer", transition:"all 0.15s" }}
-                onClick={() => { setSelId(sc.id); setView("overview"); }}>
+                onClick={() => { setSelId(sc.id); setView("overview"); setSidebarOpen(false); }}>
                 <div style={{ width:"32px", height:"32px", borderRadius:"50%",
                   background:cs.color, display:"flex", alignItems:"center", justifyContent:"center",
                   fontFamily:"'Cinzel',serif", fontSize:"14px", fontWeight:"700",
@@ -785,12 +939,26 @@ export default function RoverDashboard() {
                       background:cs.color, transition:"width 0.5s" }} />
                   </div>
                 </div>
-                <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:"4px" }}>
+                <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:"3px" }}>
                   <span style={{ fontSize:"11px", fontWeight:"700", color:cs.color }}>{ts.pct}%</span>
-                  <button className="del-btn" style={{ background:"none", border:"none",
-                    color:"#3A2010", fontSize:"10px", cursor:"pointer", padding:"1px 2px",
-                    transition:"color 0.12s" }}
-                    onClick={e => { e.stopPropagation(); deleteScout(sc.id); }}>✕</button>
+                  {isAdmin && (
+                    <div style={{ display:"flex", gap:"2px" }}>
+                      <button className="move-btn" disabled={idx===0}
+                        style={{ background:"none", border:"none",
+                          color: idx===0 ? "#241208" : "#5A4030", fontSize:"10px",
+                          cursor: idx===0 ? "default" : "pointer", padding:"0 2px" }}
+                        onClick={e => { e.stopPropagation(); moveScout(sc.id, -1); }}>▲</button>
+                      <button className="move-btn" disabled={idx===scouts.length-1}
+                        style={{ background:"none", border:"none",
+                          color: idx===scouts.length-1 ? "#241208" : "#5A4030", fontSize:"10px",
+                          cursor: idx===scouts.length-1 ? "default" : "pointer", padding:"0 2px" }}
+                        onClick={e => { e.stopPropagation(); moveScout(sc.id, 1); }}>▼</button>
+                      <button className="del-btn" style={{ background:"none", border:"none",
+                        color:"#3A2010", fontSize:"10px", cursor:"pointer", padding:"0 2px",
+                        transition:"color 0.12s" }}
+                        onClick={e => { e.stopPropagation(); deleteScout(sc.id); }}>✕</button>
+                    </div>
+                  )}
                 </div>
               </div>
             );
@@ -798,166 +966,141 @@ export default function RoverDashboard() {
         </aside>
 
         {/* ── MAIN ──────────────────────────────────────────────────────────── */}
-        <main style={{ flex:1, overflow:"auto", background:"#0A0604" }}
+        <main className="rv-main" style={{ flex:1, overflow:"auto", background:"#0A0604" }}
           onClick={() => exportMenu && setExportMenu(false)}>
 
           {/* Vacío */}
           {!selScout && view !== "attendance" && (
             <div style={{ height:"100%", display:"flex", flexDirection:"column",
-              alignItems:"center", justifyContent:"center", gap:"14px" }}>
+              alignItems:"center", justifyContent:"center", gap:"14px", padding:"20px", textAlign:"center" }}>
               <div style={{ fontSize:"80px", opacity:.05 }}>⚜</div>
               <div style={{ fontFamily:"'Cinzel',serif", fontSize:"18px",
                 color:"#D63031", letterSpacing:"1px" }}>Selecciona un Rover</div>
               <div style={{ fontSize:"13px", color:"#5A3A28",
-                fontFamily:"'Source Sans 3',sans-serif" }}>o agrega uno en el panel lateral</div>
+                fontFamily:"'Source Sans 3',sans-serif" }}>
+                {isAdmin ? "o agrega uno en el panel lateral" : "elige uno en el panel lateral para ver su progresión"}
+              </div>
             </div>
           )}
 
           {/* ── OVERVIEW ───────────────────────────────────────────────────── */}
           {selScout && view === "overview" && (
-            <div className="fade-in" style={{ padding:"20px" }}>
-              <div style={{ marginBottom:"16px" }}>
-                <div style={{ fontFamily:"'Cinzel',serif", fontSize:"16px", color:"#EDE8E1", fontWeight:"600" }}>
-                  Etapas de Progresión — <span style={{ color:"#D63031" }}>{selScout.name}</span>
+            <div className="fade-in rv-overview-pad" style={{ padding:"20px" }}>
+              <div style={{ display:"flex", justifyContent:"space-between",
+                alignItems:"flex-start", marginBottom:"16px", flexWrap:"wrap", gap:"10px" }}>
+                <div>
+                  <div style={{ fontFamily:"'Cinzel',serif", fontSize:"16px", color:"#EDE8E1", fontWeight:"600" }}>
+                    Etapas de Progresión — <span style={{ color:"#D63031" }}>{selScout.name}</span>
+                  </div>
+                  <div style={{ fontSize:"12px", color:"#9A7A60", marginTop:"4px",
+                    fontFamily:"'Source Sans 3',sans-serif" }}>
+                    {totStats.d} de {totStats.t} requisitos completados · {totStats.pct}% total
+                  </div>
                 </div>
-                <div style={{ fontSize:"12px", color:"#9A7A60", marginTop:"4px",
-                  fontFamily:"'Source Sans 3',sans-serif" }}>
-                  {totStats.d} de {totStats.t} requisitos completados · {totStats.pct}% total
+
+                {/* Export menu — global, todos los rovers */}
+                <div style={{ position:"relative" }} onClick={e => e.stopPropagation()}>
+                  <button onClick={() => setExportMenu(m => !m)}
+                    style={{ padding:"8px 14px", background:"rgba(201,162,39,0.1)",
+                      border:"1px solid rgba(201,162,39,0.3)", borderRadius:"8px",
+                      color:"#C9A227", fontSize:"12px", fontWeight:"600", cursor:"pointer",
+                      fontFamily:"'Source Sans 3',sans-serif" }}>
+                    ↓ Exportar Clan
+                  </button>
+                  {exportMenu && (
+                    <div style={{ position:"absolute", right:0, top:"calc(100% + 6px)",
+                      background:"#150B05", border:"1px solid rgba(201,162,39,0.25)",
+                      borderRadius:"9px", padding:"6px", zIndex:200, minWidth:"260px",
+                      boxShadow:"0 8px 24px rgba(0,0,0,0.4)" }}>
+                      {[
+                        ["📄 Reporte HTML / PDF — todo el Clan", () => { const html = exportAllHTML(scouts, prog, dates, attendance); const w = window.open("", "_blank"); w.document.write(html); w.document.close(); setExportMenu(false); }],
+                        ["📊 Excel / CSV — Progresión (todos)", () => { exportAllCSV(scouts, prog, dates); setExportMenu(false); }],
+                        ["📋 Excel / CSV — Asistencia (todos)", () => { exportAllAttendanceCSV(scouts, attendance); setExportMenu(false); }],
+                      ].map(([lbl, fn], i) => (
+                        <button key={i} className="ebtn" onClick={fn}
+                          style={{ display:"block", width:"100%", textAlign:"left",
+                            padding:"9px 10px", background:"none", border:"none",
+                            borderRadius:"6px", color:"#D8D0C8", fontSize:"12.5px",
+                            cursor:"pointer", fontFamily:"'Source Sans 3',sans-serif",
+                            transition:"background 0.15s" }}>{lbl}</button>
+                      ))}
+                      <div style={{ padding:"3px 10px 4px", fontSize:"10px", color:"#5A3A28",
+                        fontFamily:"'Source Sans 3',sans-serif", lineHeight:"1.5" }}>
+                        El reporte HTML incluye progresión y asistencia de todos los Rovers
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
+
               <div style={{ height:"3px", background:"rgba(255,255,255,0.05)", borderRadius:"2px",
                 overflow:"hidden", marginBottom:"22px" }}>
                 <div style={{ height:"100%", width:`${totStats.pct}%`,
                   background:"linear-gradient(90deg,#7B0F0F,#D63031,#E74C3C)",
                   borderRadius:"2px", transition:"width 0.7s" }} />
               </div>
-              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(195px,1fr))", gap:"12px" }}>
+
+              <div className="ov-grid" style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(195px,1fr))", gap:"12px" }}>
                 {STAGES.map(st => {
-                  const ss = stageStats(selId, st);
-                  const circ = 2 * Math.PI * 28;
-                  const done = ss.pct === 100;
+                  const s = stageStats(selId, st);
+                  const isCurr = activeSt === st;
                   return (
-                    <div key={st.id} className="stage-card"
-                      style={{ background:"rgba(14,7,2,0.97)",
-                        border:`1px solid ${done ? st.color+"BB" : ss.pct > 0 ? st.color+"35" : "#1A0C06"}`,
-                        borderRadius:"12px", padding:"16px", position:"relative", overflow:"hidden" }}
-                      onClick={() => { setStageId(st.id); setView("detail"); }}>
-                      {done && (
-                        <div style={{ position:"absolute", top:"8px", right:"8px",
-                          fontSize:"9px", background:"rgba(39,174,96,0.14)", color:"#27AE60",
-                          border:"1px solid rgba(39,174,96,0.35)", borderRadius:"8px",
-                          padding:"2px 7px", fontWeight:"700", letterSpacing:"0.5px",
-                          fontFamily:"'Source Sans 3',sans-serif" }}>✓ LISTO</div>
-                      )}
-                      <div style={{ fontFamily:"'Cinzel',serif", fontSize:"26px",
-                        fontWeight:"700", color:st.color, lineHeight:1 }}>{st.numeral}</div>
-                      <div style={{ fontFamily:"'Cinzel',serif", fontSize:"12px",
-                        fontWeight:"700", color:"#EDE8E1", marginTop:"5px", lineHeight:1.3 }}>{st.name}</div>
-                      <div style={{ fontSize:"11px", color:"#7A5A40", marginTop:"2px",
-                        fontFamily:"'Source Sans 3',sans-serif" }}>{st.subtitle}</div>
-                      <svg viewBox="0 0 64 64" width="60" height="60"
-                        style={{ margin:"10px auto 0", display:"block" }}>
-                        <circle cx="32" cy="32" r="28" fill="none"
-                          stroke="rgba(255,255,255,0.04)" strokeWidth="5"/>
-                        <circle cx="32" cy="32" r="28" fill="none" stroke={st.color}
-                          strokeWidth="5" strokeDasharray={circ}
-                          strokeDashoffset={circ * (1 - ss.pct / 100)}
-                          strokeLinecap="round" transform="rotate(-90 32 32)"
-                          style={{ transition:"stroke-dashoffset 0.9s cubic-bezier(.4,0,.2,1)" }}/>
-                        <text x="32" y="37" textAnchor="middle" fill={st.color}
-                          fontSize="12" fontWeight="bold" fontFamily="Georgia,serif">{ss.pct}%</text>
-                      </svg>
-                      <div style={{ fontSize:"11px", color:"#7A5A40", textAlign:"center",
-                        marginTop:"5px", fontFamily:"'Source Sans 3',sans-serif" }}>{ss.d} de {ss.t} req.</div>
-                      <div style={{ marginTop:"10px", display:"flex", gap:"5px" }}>
-                        <div style={{ flex:1, padding:"5px 0", borderRadius:"5px",
-                          fontSize:"12px", fontWeight:"600", color:"#fff", textAlign:"center",
-                          background:st.color, letterSpacing:"0.3px",
-                          fontFamily:"'Source Sans 3',sans-serif" }}>Ver detalle →</div>
-                        <div onClick={(e) => { e.stopPropagation(); setStageId(st.id); setView("radar"); }}
-                          style={{ padding:"5px 9px", borderRadius:"5px", fontSize:"12px",
-                            color:st.color, background:`${st.color}18`,
-                            border:`1px solid ${st.color}44`, cursor:"pointer",
-                            fontFamily:"'Source Sans 3',sans-serif", transition:"opacity 0.15s" }}
-                          title="Ver diagrama radar">📊</div>
+                    <div key={st.id} className="fade-in" onClick={() => { setStageId(st.id); setView("detail"); }}
+                      style={{ background:"rgba(14,7,2,0.97)", border:`1px solid ${st.color}30`,
+                        borderRadius:"12px", padding:"14px", cursor:"pointer",
+                        transition:"transform 0.15s" }}>
+                      <div style={{ display:"flex", justifyContent:"space-between",
+                        alignItems:"flex-start", marginBottom:"8px" }}>
+                        <span style={{ fontFamily:"'Cinzel',serif", fontSize:"22px",
+                          fontWeight:"700", color:st.color, opacity:.5 }}>{st.numeral}</span>
+                        <span style={{ fontSize:"15px", fontWeight:"700", color:st.color }}>{s.pct}%</span>
                       </div>
+                      <div style={{ fontSize:"13.5px", fontWeight:"700", color:"#EDE8E1" }}>{st.name}</div>
+                      <div style={{ fontSize:"10.5px", color:"#9A7A60", marginTop:"1px" }}>{st.subtitle}</div>
+                      <div style={{ height:"3px", background:"rgba(255,255,255,0.05)",
+                        borderRadius:"2px", overflow:"hidden", marginTop:"9px" }}>
+                        <div style={{ height:"100%", width:`${s.pct}%`, background:st.color,
+                          borderRadius:"2px", transition:"width 0.5s" }} />
+                      </div>
+                      <div style={{ fontSize:"10px", color:"#5A3A28", marginTop:"6px" }}>{s.d}/{s.t} requisitos</div>
                     </div>
                   );
                 })}
+                <div onClick={() => setView("radar")}
+                  style={{ background:"rgba(201,162,39,0.05)", border:"1px solid rgba(201,162,39,0.2)",
+                    borderRadius:"12px", padding:"14px", cursor:"pointer",
+                    display:"flex", flexDirection:"column", alignItems:"center",
+                    justifyContent:"center", gap:"6px", minHeight:"110px" }}>
+                  <span style={{ fontSize:"22px" }}>📊</span>
+                  <span style={{ fontSize:"12px", fontWeight:"600", color:"#C9A227",
+                    fontFamily:"'Source Sans 3',sans-serif" }}>Ver Radar</span>
+                </div>
               </div>
             </div>
           )}
 
           {/* ── RADAR VIEW ─────────────────────────────────────────────────── */}
           {selScout && view === "radar" && (
-            <div className="fade-in" style={{ padding:"20px" }}>
-              <div style={{ display:"flex", alignItems:"center", gap:"12px", marginBottom:"18px" }}>
-                <button className="back-btn" onClick={() => setView("overview")}
-                  style={{ padding:"6px 13px", background:"none",
-                    border:"1px solid rgba(255,255,255,0.09)", borderRadius:"6px",
-                    color:"#9A7A60", fontSize:"12px", cursor:"pointer",
-                    fontFamily:"'Source Sans 3',sans-serif", transition:"color 0.15s" }}>← Resumen</button>
-                <div>
-                  <div style={{ fontFamily:"'Cinzel',serif", fontSize:"15px",
-                    fontWeight:"700", color:"#EDE8E1" }}>
-                    Áreas de Crecimiento — <span style={{ color:activeSt.color }}>{activeSt.name}</span>
-                  </div>
-                  <div style={{ fontSize:"12px", color:"#9A7A60", marginTop:"2px",
-                    fontFamily:"'Source Sans 3',sans-serif" }}>{selScout.name}</div>
-                </div>
-              </div>
-              {/* Tabs */}
-              <div style={{ display:"flex", gap:"6px", marginBottom:"20px", flexWrap:"wrap" }}>
+            <div className="fade-in" style={{ padding:"16px 20px" }}>
+              <button className="back-btn" onClick={() => setView("overview")}
+                style={{ padding:"6px 12px", background:"none",
+                  border:"1px solid rgba(255,255,255,0.09)", borderRadius:"6px",
+                  color:"#9A7A60", fontSize:"12px", cursor:"pointer", marginBottom:"14px",
+                  fontFamily:"'Source Sans 3',sans-serif" }}>← Resumen</button>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(260px,1fr))",
+                gap:"18px" }}>
                 {STAGES.map(st => (
-                  <button key={st.id} className="stab"
-                    style={{ padding:"5px 14px",
-                      background: stageId === st.id ? st.color : "rgba(20,10,3,0.7)",
-                      border:`1px solid ${stageId === st.id ? st.color : "rgba(255,255,255,0.07)"}`,
-                      borderRadius:"16px",
-                      color: stageId === st.id ? "#fff" : "#9A7A60",
-                      fontSize:"12px", fontFamily:"'Cinzel',serif", cursor:"pointer",
-                      fontWeight: stageId === st.id ? "700" : "500",
-                      transition:"all 0.15s" }}
-                    onClick={() => setStageId(st.id)}>{st.numeral} {st.name}</button>
+                  <div key={st.id} style={{ background:"rgba(14,7,2,0.97)",
+                    border:`1px solid ${st.color}25`, borderRadius:"12px", padding:"16px" }}>
+                    <div style={{ textAlign:"center", marginBottom:"6px" }}>
+                      <span style={{ fontFamily:"'Cinzel',serif", fontSize:"13px",
+                        fontWeight:"700", color:st.color }}>{st.name}</span>
+                    </div>
+                    <div className="radar-svg-wrap">
+                      <RadarChart stage={st} scoutId={selId} prog={prog} size={220} />
+                    </div>
+                  </div>
                 ))}
-              </div>
-              {/* Grid radar + áreas */}
-              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:"16px" }}>
-                <div style={{ background:"rgba(14,7,2,0.97)",
-                  border:`1px solid ${activeSt.color}33`, borderRadius:"12px", padding:"20px" }}>
-                  <div style={{ fontFamily:"'Cinzel',serif", fontSize:"10px",
-                    color:"#C9A227", letterSpacing:"1.5px", marginBottom:"14px",
-                    textAlign:"center" }}>DIAGRAMA RADAR · ÁREAS DE CRECIMIENTO</div>
-                  <RadarChart stage={activeSt} scoutId={selId} prog={prog} size={210} />
-                </div>
-                <div style={{ background:"rgba(14,7,2,0.97)",
-                  border:`1px solid ${activeSt.color}33`, borderRadius:"12px",
-                  padding:"18px", display:"flex", flexDirection:"column", gap:"11px" }}>
-                  <div style={{ fontFamily:"'Cinzel',serif", fontSize:"10px",
-                    color:"#C9A227", letterSpacing:"1.5px", marginBottom:"2px" }}>DETALLE POR ÁREA</div>
-                  {activeSt.areas.map((area, i) => {
-                    const sc = areaScore(selId, activeSt, area);
-                    return (
-                      <div key={area}>
-                        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:"3px" }}>
-                          <span style={{ fontSize:"13px", fontWeight:"600", color:"#EDE8E1",
-                            fontFamily:"'Source Sans 3',sans-serif" }}>{area}</span>
-                          <span style={{ fontSize:"13px", fontWeight:"700", color:activeSt.color,
-                            fontFamily:"'Source Sans 3',sans-serif" }}>{sc}%</span>
-                        </div>
-                        <div style={{ fontSize:"11px", color:"#7A5A40", marginBottom:"5px",
-                          fontFamily:"'Source Sans 3',sans-serif", lineHeight:"1.4" }}>
-                          {activeSt.areaDesc[i]}
-                        </div>
-                        <div style={{ height:"4px", background:"rgba(255,255,255,0.06)",
-                          borderRadius:"2px", overflow:"hidden" }}>
-                          <div style={{ height:"100%", width:`${sc}%`,
-                            background:activeSt.color, borderRadius:"2px", transition:"width 0.5s" }} />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
               </div>
             </div>
           )}
@@ -970,7 +1113,7 @@ export default function RoverDashboard() {
             const todayStr = new Date().toISOString().split("T")[0];
             const pad2 = (n) => String(n).padStart(2, "0");
             const days = Array.from({ length: daysInMonth }, (_, i) => i + 1)
-              .filter(d => [5, 6, 0].includes(new Date(y, m, d).getDay())); // Vie(5), Sáb(6), Dom(0)
+              .filter(d => [5, 6, 0].includes(new Date(y, m, d).getDay()));
             const dateOf = (d) => `${y}-${pad2(m + 1)}-${pad2(d)}`;
             const dowShort = (d) => ["D","L","M","X","J","V","S"][new Date(y, m, d).getDay()];
 
@@ -978,7 +1121,6 @@ export default function RoverDashboard() {
               <div className="fade-in" style={{ padding:"14px 18px", display:"flex",
                 flexDirection:"column", gap:"10px" }}>
 
-                {/* Cabecera */}
                 <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between",
                   flexWrap:"wrap", gap:"8px" }}>
                   <div style={{ fontFamily:"'Cinzel',serif", fontSize:"15px",
@@ -1000,7 +1142,6 @@ export default function RoverDashboard() {
                   </div>
                 </div>
 
-                {/* Leyenda */}
                 <div style={{ display:"flex", gap:"12px", flexWrap:"wrap", padding:"4px 9px",
                   background:"rgba(255,255,255,0.015)", borderRadius:"6px",
                   border:"1px solid rgba(255,255,255,0.04)" }}>
@@ -1008,20 +1149,18 @@ export default function RoverDashboard() {
                     <span key={s.label} style={{ fontSize:"10.5px", color:s.color,
                       fontFamily:"'Source Sans 3',sans-serif" }}>● {s.short} = {s.label}</span>
                   ))}
-                  <span style={{ fontSize:"10.5px", color:"#5A3A28",
-                    fontFamily:"'Source Sans 3',sans-serif" }}>— clic en la celda para marcar/cambiar</span>
+                  {isAdmin && <span style={{ fontSize:"10.5px", color:"#5A3A28",
+                    fontFamily:"'Source Sans 3',sans-serif" }}>— clic en la celda para marcar/cambiar</span>}
                 </div>
 
-                {/* Sin rovers */}
                 {scouts.length === 0 ? (
                   <div style={{ textAlign:"center", padding:"36px 12px", opacity:.6 }}>
                     <div style={{ fontSize:"32px", opacity:.2, marginBottom:"8px" }}>⚜</div>
                     <div style={{ fontSize:"12px", color:"#5A3A28",
-                      fontFamily:"'Source Sans 3',sans-serif" }}>Agrega Rovers en el panel lateral para registrar asistencia</div>
+                      fontFamily:"'Source Sans 3',sans-serif" }}>Aún no hay Rovers registrados</div>
                   </div>
                 ) : (
-                  /* Tabla planilla */
-                  <div style={{ overflowX:"auto", border:"1px solid rgba(91,143,168,0.18)",
+                  <div className="att-table-wrap" style={{ overflowX:"auto", border:"1px solid rgba(91,143,168,0.18)",
                     borderRadius:"9px", background:"rgba(14,7,2,0.97)" }}>
                     <table style={{ borderCollapse:"collapse", width:"100%", fontSize:"10.5px" }}>
                       <thead>
@@ -1081,9 +1220,9 @@ export default function RoverDashboard() {
                                     borderBottom:"1px solid rgba(255,255,255,0.03)",
                                     borderLeft: weekStart ? "2px solid rgba(201,162,39,0.12)" : "none" }}>
                                     <div className="att-cell" onClick={() => cycleAttStatus(sc.id, date)}
-                                      title={rec?.note || "Clic para marcar"}
+                                      title={rec?.note || (isAdmin ? "Clic para marcar" : "")}
                                       style={{ width:"19px", height:"19px", margin:"0 auto",
-                                        borderRadius:"4px", cursor:"pointer",
+                                        borderRadius:"4px", cursor: isAdmin ? "pointer" : "default",
                                         display:"flex", alignItems:"center", justifyContent:"center",
                                         background: st ? `${st.color}30` : "rgba(255,255,255,0.025)",
                                         border: st ? `1px solid ${st.color}77` : "1px solid rgba(255,255,255,0.05)",
@@ -1121,237 +1260,180 @@ export default function RoverDashboard() {
 
           {/* ── DETAIL VIEW ──────────────────────────────────────────────────── */}
           {selScout && view === "detail" && (
-            <div className="fade-in" style={{ padding:"16px 20px", display:"flex",
+            <div className="fade-in rv-detail-pad" style={{ padding:"16px 20px", display:"flex",
               flexDirection:"column", gap:"12px" }}>
+              {(() => {
+                const s = stageStats(selId, activeSt);
+                const inv = invDates[invKey(selId, activeSt.id)];
+                return (<>
+                  <div style={{ display:"flex", alignItems:"flex-start", gap:"12px", flexWrap:"wrap" }}>
+                    <button className="back-btn" onClick={() => setView("overview")}
+                      style={{ padding:"6px 12px", background:"none",
+                        border:"1px solid rgba(255,255,255,0.09)", borderRadius:"6px",
+                        color:"#9A7A60", fontSize:"12px", cursor:"pointer", flexShrink:0,
+                        marginTop:"4px", fontFamily:"'Source Sans 3',sans-serif" }}>← Resumen</button>
+                    <div style={{ flex:1, minWidth:"200px" }}>
+                      <div style={{ display:"flex", alignItems:"center", gap:"8px", flexWrap:"wrap" }}>
+                        <span style={{ fontFamily:"'Cinzel',serif", fontSize:"20px",
+                          fontWeight:"700", color:activeSt.color, opacity:.6 }}>{activeSt.numeral}</span>
+                        <span style={{ fontFamily:"'Cinzel',serif", fontSize:"17px",
+                          fontWeight:"700", color:"#EDE8E1" }}>{activeSt.name}</span>
+                      </div>
+                      <div style={{ fontSize:"12px", color:"#9A7A60", marginTop:"2px" }}>{activeSt.subtitle}</div>
+                      <div style={{ fontSize:"11.5px", color:"#7A5A40", marginTop:"6px", maxWidth:"480px",
+                        lineHeight:"1.5", fontFamily:"'Source Sans 3',sans-serif" }}>{activeSt.description}</div>
+                    </div>
+                    <div style={{ textAlign:"right", flexShrink:0 }}>
+                      <div style={{ fontFamily:"'Cinzel',serif", fontSize:"28px",
+                        fontWeight:"700", color:activeSt.color, lineHeight:1 }}>{s.pct}%</div>
+                      <div style={{ fontSize:"11px", color:"#9A7A60", marginTop:"4px" }}>{s.d}/{s.t} requisitos</div>
+                    </div>
+                  </div>
 
-              {/* Cabecera */}
-              <div style={{ display:"flex", alignItems:"flex-start", gap:"12px" }}>
-                <button className="back-btn" onClick={() => setView("overview")}
-                  style={{ padding:"6px 12px", background:"none",
-                    border:"1px solid rgba(255,255,255,0.09)", borderRadius:"6px",
-                    color:"#9A7A60", fontSize:"12px", cursor:"pointer", flexShrink:0,
-                    marginTop:"4px", transition:"color 0.15s",
-                    fontFamily:"'Source Sans 3',sans-serif" }}>← Resumen</button>
-                <div style={{ flex:1 }}>
-                  <div style={{ fontFamily:"'Cinzel',serif", fontSize:"28px",
-                    fontWeight:"700", color:activeSt.color, lineHeight:1 }}>{activeSt.numeral}</div>
-                  <div style={{ fontFamily:"'Cinzel',serif", fontSize:"17px",
-                    fontWeight:"700", color:"#EDE8E1", marginTop:"5px" }}>{activeSt.name}</div>
-                  <div style={{ fontSize:"12px", color:"#7A5A40", marginTop:"2px",
-                    fontFamily:"'Source Sans 3',sans-serif" }}>{activeSt.subtitle}</div>
-                </div>
-                <div style={{ textAlign:"right", flexShrink:0 }}>
-                  {(() => { const s = stageStats(selId, activeSt); return (<>
-                    <div style={{ fontFamily:"'Cinzel',serif", fontSize:"32px",
-                      fontWeight:"700", color:activeSt.color, lineHeight:1 }}>{s.pct}%</div>
-                    <div style={{ fontSize:"12px", color:"#9A7A60", marginTop:"4px",
-                      fontFamily:"'Source Sans 3',sans-serif" }}>{s.d}/{s.t} requisitos</div>
+                  {/* Selector de etapa */}
+                  <div style={{ display:"flex", gap:"6px", flexWrap:"wrap" }}>
+                    {STAGES.map(st => (
+                      <button key={st.id} className="stab" onClick={() => setStageId(st.id)}
+                        style={{ padding:"5px 12px", background: st.id === stageId ? `${st.color}22` : "rgba(255,255,255,0.03)",
+                          border:`1px solid ${st.id === stageId ? st.color+"55" : "rgba(255,255,255,0.06)"}`,
+                          borderRadius:"6px", color: st.id === stageId ? st.color : "#7A5A40",
+                          fontSize:"11.5px", fontWeight:"600", cursor:"pointer",
+                          fontFamily:"'Source Sans 3',sans-serif" }}>{st.numeral} {st.name}</button>
+                    ))}
                     <button className="stab" onClick={() => setView("radar")}
-                      style={{ marginTop:"6px", padding:"4px 10px",
+                      style={{ padding:"5px 12px",
                         background:`${activeSt.color}18`,
                         border:`1px solid ${activeSt.color}44`,
-                        borderRadius:"5px", color:activeSt.color, fontSize:"11px",
+                        borderRadius:"6px", color:activeSt.color, fontSize:"11.5px",
                         cursor:"pointer", fontFamily:"'Source Sans 3',sans-serif",
-                        fontWeight:"600", transition:"opacity 0.15s" }}>📊 Ver Radar</button>
-                  </>); })()}
-                </div>
-              </div>
+                        fontWeight:"600" }}>📊 Ver Radar</button>
+                  </div>
 
-              {/* Descripción */}
-              <div style={{ padding:"10px 14px", background:"rgba(20,10,3,0.6)",
-                border:`1px solid ${activeSt.color}22`, borderRadius:"8px",
-                fontSize:"13px", color:"#9A7A60", lineHeight:"1.65",
-                fontFamily:"'Source Sans 3',sans-serif" }}>
-                {activeSt.description}
-              </div>
+                  {/* Investidura */}
+                  <div onClick={() => toggleInv(activeSt.id)}
+                    style={{ display:"flex", alignItems:"center", gap:"9px", padding:"10px 14px",
+                      background: inv ? `${activeSt.color}14` : "rgba(255,255,255,0.02)",
+                      border:`1px solid ${inv ? activeSt.color+"44" : "rgba(255,255,255,0.05)"}`,
+                      borderRadius:"9px", cursor: isAdmin ? "pointer" : "default" }}>
+                    <div style={{ width:"18px", height:"18px", borderRadius:"5px",
+                      border:`1.5px solid ${inv ? activeSt.color : "rgba(255,255,255,0.2)"}`,
+                      background: inv ? activeSt.color : "transparent",
+                      display:"flex", alignItems:"center", justifyContent:"center",
+                      flexShrink:0, fontSize:"11px", color:"#fff" }}>{inv && "✓"}</div>
+                    <div>
+                      <div style={{ fontSize:"12.5px", fontWeight:"700", color: inv ? activeSt.color : "#9A7A60",
+                        fontFamily:"'Source Sans 3',sans-serif" }}>🎖️ {activeSt.investidura}</div>
+                      {inv && <div style={{ fontSize:"10.5px", color:"#7A5A40", marginTop:"1px" }}>Realizada el {inv}</div>}
+                    </div>
+                  </div>
 
-              {/* Tabs etapas */}
-              <div style={{ display:"flex", gap:"5px", flexWrap:"wrap" }}>
-                {STAGES.map(st => {
-                  const ss = stageStats(selId, st);
-                  const isA = st.id === stageId;
-                  return (
-                    <button key={st.id} className="stab"
-                      style={{ padding:"4px 13px",
-                        background: isA ? st.color : "rgba(20,10,3,0.7)",
-                        border:`1px solid ${isA ? st.color : "rgba(255,255,255,0.07)"}`,
-                        borderRadius:"14px", color: isA ? "#fff" : "#9A7A60",
-                        fontSize:"12px", fontFamily:"'Cinzel',serif",
-                        cursor:"pointer", transition:"all 0.15s",
-                        fontWeight: isA ? "700" : "500" }}
-                      onClick={() => setStageId(st.id)}>
-                      {st.numeral}{ss.pct === 100 ? " ✓" : ""}
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* Leyenda */}
-              <div style={{ display:"flex", gap:"14px", flexWrap:"wrap", padding:"5px 10px",
-                background:"rgba(255,255,255,0.015)", borderRadius:"6px",
-                border:"1px solid rgba(255,255,255,0.04)" }}>
-                {[
-                  ["#7A5A40","☐ Pendiente"],
-                  [activeSt.color,"☑ Completado"],
-                  ["#5A8AAA","📅 Fecha"],
-                  ["#7A8A5A","📝 Observación"],
-                ].map(([c, t]) => (
-                  <span key={t} style={{ fontSize:"11px", color:c,
-                    fontFamily:"'Source Sans 3',sans-serif" }}>{t}</span>
-                ))}
-              </div>
-
-              {/* Bloque de Investidura */}
-              <div style={{ background:"rgba(201,162,39,0.06)",
-                border:"1px solid rgba(201,162,39,0.15)", borderRadius:"9px",
-                padding:"10px 14px", display:"flex",
-                alignItems:"center", justifyContent:"space-between",
-                flexWrap:"wrap", gap:"8px" }}>
-                <div>
-                  <div style={{ fontFamily:"'Cinzel',serif", fontSize:"9px",
-                    color:"#C9A227", letterSpacing:"1.5px", marginBottom:"2px" }}>HITO DE INVESTIDURA</div>
-                  <div style={{ fontSize:"14px", fontWeight:"700", color:"#EDE8E1",
-                    fontFamily:"'Source Sans 3',sans-serif" }}>{activeSt.investidura}</div>
-                </div>
-                <div style={{ display:"flex", alignItems:"center", gap:"8px" }}>
-                  <span style={{ fontSize:"12px", color:"#9A7A60",
-                    fontFamily:"'Source Sans 3',sans-serif" }}>Fecha:</span>
-                  <input type="date" className="di"
-                    style={{ width:"130px", fontSize:"12px" }}
-                    value={invDates[invKey(selId, activeSt.id)] || ""}
-                    onChange={e => setInvDate(activeSt.id, e.target.value)} />
-                </div>
-              </div>
-
-              {/* Grid de secciones */}
-              <div style={{ display:"grid",
-                gridTemplateColumns:"repeat(auto-fill,minmax(295px,1fr))", gap:"8px" }}>
-                {activeSt.sections.map(sec => {
-                  let sd = 0;
-                  sec.items.forEach((_, i) => { if (prog[pKey(selId, activeSt.id, sec.name, i)]) sd++; });
-                  const secPct = Math.round(sd / sec.items.length * 100);
-                  const secKey = `${activeSt.id}|${sec.name}`;
-                  const collapsed = !!collapsedSecs[secKey];
-                  return (
-                    <div key={sec.name} style={{ background:"rgba(14,7,2,0.97)",
-                      border:"1px solid rgba(201,162,39,0.06)", borderRadius:"10px",
-                      overflow:"hidden" }}>
-                      {/* Cabecera sección */}
-                      <div className="sec-hdr" onClick={() => toggleSec(secKey)}
-                        style={{ display:"flex", justifyContent:"space-between",
-                          alignItems:"center", padding:"9px 12px", cursor:"pointer",
-                          transition:"background 0.14s" }}>
-                        <div style={{ flex:1, minWidth:0 }}>
-                          <div style={{ fontFamily:"'Cinzel',serif", fontSize:"9.5px",
-                            fontWeight:"700", color:"#C9A227", letterSpacing:"1px",
-                            textTransform:"uppercase" }}>{sec.name}</div>
-                          <div style={{ fontSize:"10px", color:activeSt.color, marginTop:"1px",
-                            fontFamily:"'Source Sans 3',sans-serif" }}>Área: {sec.area}</div>
+                  {/* Secciones */}
+                  {activeSt.sections.map(sec => {
+                    let sd = 0;
+                    sec.items.forEach((_, i) => { if (prog[pKey(selId, activeSt.id, sec.name, i)]) sd++; });
+                    const secPct = Math.round(sd / sec.items.length * 100);
+                    const secKey = `${activeSt.id}|${sec.name}`;
+                    const collapsed = !!collapsedSecs[secKey];
+                    return (
+                      <div key={sec.name} style={{ background:"rgba(14,7,2,0.97)",
+                        border:"1px solid rgba(201,162,39,0.06)", borderRadius:"10px",
+                        overflow:"hidden" }}>
+                        <div className="sec-hdr" onClick={() => toggleSec(secKey)}
+                          style={{ display:"flex", justifyContent:"space-between",
+                            alignItems:"center", padding:"9px 12px", cursor:"pointer" }}>
+                          <div style={{ flex:1, minWidth:0 }}>
+                            <div style={{ fontFamily:"'Cinzel',serif", fontSize:"9.5px",
+                              fontWeight:"700", color:"#C9A227", letterSpacing:"1px",
+                              textTransform:"uppercase" }}>{sec.name}</div>
+                            <div style={{ fontSize:"10px", color:activeSt.color, marginTop:"1px",
+                              fontFamily:"'Source Sans 3',sans-serif" }}>Área: {sec.area}</div>
+                          </div>
+                          <div style={{ display:"flex", alignItems:"center", gap:"8px", flexShrink:0 }}>
+                            <span style={{ fontSize:"12px", fontWeight:"700", color:activeSt.color,
+                              fontFamily:"'Source Sans 3',sans-serif" }}>{sd}/{sec.items.length}</span>
+                            <span style={{ fontSize:"10px", color:"#5A3A28" }}>{collapsed ? "▼" : "▲"}</span>
+                          </div>
                         </div>
-                        <div style={{ display:"flex", alignItems:"center", gap:"8px", flexShrink:0 }}>
-                          <span style={{ fontSize:"12px", fontWeight:"700", color:activeSt.color,
-                            fontFamily:"'Source Sans 3',sans-serif" }}>{sd}/{sec.items.length}</span>
-                          <span style={{ fontSize:"10px", color:"#5A3A28" }}>{collapsed ? "▼" : "▲"}</span>
+                        <div style={{ height:"2px", background:"rgba(255,255,255,0.04)" }}>
+                          <div style={{ height:"100%", width:`${secPct}%`,
+                            background:activeSt.color, transition:"width 0.4s" }} />
                         </div>
-                      </div>
-                      {/* Barra progreso sección */}
-                      <div style={{ height:"2px", background:"rgba(255,255,255,0.04)" }}>
-                        <div style={{ height:"100%", width:`${secPct}%`,
-                          background:activeSt.color, transition:"width 0.4s" }} />
-                      </div>
-                      {/* Items */}
-                      {!collapsed && (
-                        <div style={{ padding:"6px 8px", display:"flex",
-                          flexDirection:"column", gap:"0px" }}>
-                          {sec.items.map((item, idx) => {
-                            const k  = pKey(selId, activeSt.id, sec.name, idx);
-                            const dk = dKey(selId, activeSt.id, sec.name, idx);
-                            const nk = nKey(selId, activeSt.id, sec.name, idx);
-                            const chk      = !!prog[k];
-                            const itemDate = dates[dk] || "";
-                            const itemNote = notes[nk] || "";
-                            const expK     = `${activeSt.id}|${sec.name}|${idx}`;
-                            const isExp    = expItem === expK;
-                            return (
-                              <div key={idx}>
-                                <div className="check-row"
-                                  style={{ display:"flex", alignItems:"flex-start",
-                                    gap:"7px", padding:"5px 5px", borderRadius:"5px",
-                                    border:"1px solid transparent",
-                                    transition:"background 0.12s" }}>
-                                  {/* Checkbox */}
-                                  <div onClick={() => toggleItem(activeSt.id, sec.name, idx)}
-                                    style={{ width:"16px", height:"16px", borderRadius:"4px",
-                                      border:`1.5px solid ${chk ? activeSt.color : "rgba(255,255,255,0.2)"}`,
-                                      background: chk ? activeSt.color : "transparent",
-                                      display:"flex", alignItems:"center", justifyContent:"center",
-                                      flexShrink:0, fontSize:"10px", color:"#fff",
-                                      transition:"all 0.15s", marginTop:"2px", cursor:"pointer" }}>
-                                    {chk && "✓"}
+                        {!collapsed && (
+                          <div style={{ padding:"6px 8px", display:"flex",
+                            flexDirection:"column", gap:"0px" }}>
+                            {sec.items.map((item, idx) => {
+                              const k  = pKey(selId, activeSt.id, sec.name, idx);
+                              const dk = dKey(selId, activeSt.id, sec.name, idx);
+                              const chk      = !!prog[k];
+                              const itemDate = dates[dk] || "";
+                              const expK     = `${activeSt.id}|${sec.name}|${idx}`;
+                              const isExp    = expItem === expK;
+                              return (
+                                <div key={idx}>
+                                  <div className="check-row"
+                                    style={{ display:"flex", alignItems:"flex-start",
+                                      gap:"7px", padding:"5px 5px", borderRadius:"5px",
+                                      border:"1px solid transparent" }}>
+                                    <div onClick={() => toggleItem(activeSt.id, sec.name, idx)}
+                                      style={{ width:"16px", height:"16px", borderRadius:"4px",
+                                        border:`1.5px solid ${chk ? activeSt.color : "rgba(255,255,255,0.2)"}`,
+                                        background: chk ? activeSt.color : "transparent",
+                                        display:"flex", alignItems:"center", justifyContent:"center",
+                                        flexShrink:0, fontSize:"10px", color:"#fff",
+                                        marginTop:"2px", cursor: isAdmin ? "pointer" : "default" }}>
+                                      {chk && "✓"}
+                                    </div>
+                                    <span onClick={() => toggleItem(activeSt.id, sec.name, idx)}
+                                      style={{ fontSize:"13px",
+                                        color: chk ? "#5A4030" : "#D8D0C8",
+                                        textDecoration: chk ? "line-through" : "none",
+                                        lineHeight:"1.45", flex:1, cursor: isAdmin ? "pointer" : "default",
+                                        fontFamily:"'Source Sans 3',sans-serif" }}>
+                                      {item}
+                                    </span>
+                                    <button className="expbtn"
+                                      style={{ background:"none", border:"none",
+                                        color: isExp ? "#C9A227" : "#3A2818",
+                                        fontSize:"10px", cursor:"pointer",
+                                        padding:"2px 4px", flexShrink:0,
+                                        marginTop:"2px" }}
+                                      title="Fecha de cumplimiento"
+                                      onClick={() => setExpItem(isExp ? null : expK)}>
+                                      {isExp ? "▲" : "▼"}
+                                    </button>
                                   </div>
-                                  {/* Texto */}
-                                  <span onClick={() => toggleItem(activeSt.id, sec.name, idx)}
-                                    style={{ fontSize:"13px",
-                                      color: chk ? "#5A4030" : "#D8D0C8",
-                                      textDecoration: chk ? "line-through" : "none",
-                                      lineHeight:"1.45", flex:1, cursor:"pointer",
-                                      fontFamily:"'Source Sans 3',sans-serif" }}>
-                                    {item}
-                                  </span>
-                                  {/* Toggle expand */}
-                                  <button className="expbtn"
-                                    style={{ background:"none", border:"none",
-                                      color: isExp ? "#C9A227" : "#3A2818",
-                                      fontSize:"10px", cursor:"pointer",
-                                      padding:"2px 4px", flexShrink:0,
-                                      transition:"color 0.12s", marginTop:"2px" }}
-                                    title="Fecha y observaciones"
-                                    onClick={() => setExpItem(isExp ? null : expK)}>
-                                    {isExp ? "▲" : "▼"}
-                                  </button>
-                                </div>
-                                {/* Panel expandido */}
-                                {isExp && (
-                                  <div className="fade-in"
-                                    style={{ marginLeft:"23px", marginBottom:"4px",
-                                      padding:"8px 9px", background:"rgba(30,15,5,0.7)",
-                                      border:"1px solid rgba(201,162,39,0.1)",
-                                      borderRadius:"6px", display:"flex",
-                                      flexDirection:"column", gap:"6px" }}>
-                                    <div style={{ display:"flex", alignItems:"center", gap:"7px" }}>
+                                  {isExp && (
+                                    <div className="fade-in"
+                                      style={{ marginLeft:"23px", marginBottom:"4px",
+                                        padding:"8px 9px", background:"rgba(30,15,5,0.7)",
+                                        border:"1px solid rgba(201,162,39,0.1)",
+                                        borderRadius:"6px", display:"flex",
+                                        alignItems:"center", gap:"7px" }}>
                                       <span style={{ fontSize:"11px", color:"#5A7A8A",
                                         whiteSpace:"nowrap",
                                         fontFamily:"'Source Sans 3',sans-serif" }}>📅 Fecha:</span>
                                       <input type="date" className="di"
+                                        disabled={!isAdmin}
                                         value={itemDate}
                                         onChange={e => setItemDate(activeSt.id, sec.name, idx, e.target.value)} />
-                                      {itemDate && (
+                                      {itemDate && isAdmin && (
                                         <button onClick={() => setItemDate(activeSt.id, sec.name, idx, "")}
                                           style={{ background:"none", border:"none",
                                             color:"#3A2818", fontSize:"10px",
                                             cursor:"pointer", padding:"0 3px" }}>✕</button>
                                       )}
                                     </div>
-                                    <div style={{ display:"flex", alignItems:"flex-start", gap:"7px" }}>
-                                      <span style={{ fontSize:"11px", color:"#5A8A5A",
-                                        whiteSpace:"nowrap", marginTop:"4px",
-                                        fontFamily:"'Source Sans 3',sans-serif" }}>📝 Obs.:</span>
-                                      <textarea className="ni" rows={2}
-                                        placeholder="Evidencia, notas, observaciones…"
-                                        value={itemNote}
-                                        onChange={e => setItemNote(activeSt.id, sec.name, idx, e.target.value)} />
-                                    </div>
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </>);
+              })()}
             </div>
           )}
         </main>
@@ -1359,4 +1441,3 @@ export default function RoverDashboard() {
     </div>
   );
 }
-
