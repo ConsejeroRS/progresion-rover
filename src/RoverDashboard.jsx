@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { db, auth } from "./firebase";
 import {
-  doc, onSnapshot, setDoc, getDoc
+  doc, onSnapshot, setDoc, updateDoc, deleteField, getDoc
 } from "firebase/firestore";
 import {
   signInWithEmailAndPassword, signOut, onAuthStateChanged
@@ -635,21 +635,52 @@ export default function RoverDashboard() {
     return unsub;
   }, []);
 
-  // ── Guardado: persiste el documento en Firestore, en cola secuencial ──
+  // ── Guardado: persiste en Firestore, en cola secuencial ──
   // (evita que clics rápidos disparen escrituras en paralelo que se pisen entre sí)
   const writeQueue = useRef(Promise.resolve());
+
+  // persist({ campo: valor }) -> reemplaza el campo completo (para listas/objetos ya armados)
   const persist = (patch) => {
     const next = { ...dataRef.current, ...patch };
     dataRef.current = next;
     pendingWrites.current += 1;
     writeQueue.current = writeQueue.current
-      .catch(() => {}) // no dejar que un fallo anterior bloquee la cola
-      .then(() => setDoc(DOC_REF, next, { merge: true }))
+      .catch(() => {})
+      .then(() => setDoc(DOC_REF, patch, { merge: true }))
       .then(() => setSaveErr(false))
       .catch(() => setSaveErr(true))
       .finally(() => { pendingWrites.current = Math.max(0, pendingWrites.current - 1); });
     return writeQueue.current;
   };
+
+  // persistField('mapa', 'clave', valor | null) -> escribe o BORRA una sola clave
+  // dentro de un mapa anidado, usando notación de punto + deleteField().
+  // Esto es necesario porque setDoc(...,{merge:true}) con un objeto completo
+  // NUNCA borra claves que falten en el objeto enviado — solo las que pasamos
+  // explícitamente con deleteField() se eliminan de verdad en el servidor.
+  const persistField = (mapName, key, value) => {
+    const nextMap = { ...dataRef.current[mapName] };
+    if (value === null) delete nextMap[key]; else nextMap[key] = value;
+    dataRef.current = { ...dataRef.current, [mapName]: nextMap };
+    pendingWrites.current += 1;
+    const fieldPath = `${mapName}.${key}`;
+    writeQueue.current = writeQueue.current
+      .catch(() => {})
+      .then(() => updateDoc(DOC_REF, { [fieldPath]: value === null ? deleteField() : value }))
+      .catch((err) => {
+        // El documento aún no existe (raro, pero posible la primera vez):
+        // si estamos ESCRIBIENDO, creamos el doc completo como red de seguridad.
+        // Si estamos BORRANDO, no hay nada que borrar, lo ignoramos.
+        if (value !== null) {
+          return setDoc(DOC_REF, { [mapName]: nextMap }, { merge: true });
+        }
+      })
+      .then(() => setSaveErr(false))
+      .catch(() => setSaveErr(true))
+      .finally(() => { pendingWrites.current = Math.max(0, pendingWrites.current - 1); });
+    return writeQueue.current;
+  };
+
   const saveScouts = (v) => { setScouts(v); persist({ scouts: v }); };
   const saveProg   = (v) => { setProg(v);   persist({ prog: v }); };
   const saveDates  = (v) => { setDates(v);  persist({ dates: v }); };
@@ -669,9 +700,23 @@ export default function RoverDashboard() {
     const cur = dataRef.current;
     const upd = cur.scouts.filter(s => s.id !== id);
     saveScouts(upd); if (selId === id) setSelId(upd[0]?.id || null);
+
     const na = { ...cur.attendance };
-    Object.keys(na).forEach(k => { if (k.startsWith(`att:${id}|`)) delete na[k]; });
-    saveAtt(na);
+    const keysToDelete = Object.keys(na).filter(k => k.startsWith(`att:${id}|`));
+    if (keysToDelete.length) {
+      keysToDelete.forEach(k => delete na[k]);
+      dataRef.current = { ...dataRef.current, attendance: na };
+      setAttendance(na);
+      pendingWrites.current += 1;
+      const updatePatch = {};
+      keysToDelete.forEach(k => { updatePatch[`attendance.${k}`] = deleteField(); });
+      writeQueue.current = writeQueue.current
+        .catch(() => {})
+        .then(() => updateDoc(DOC_REF, updatePatch))
+        .catch(() => {}) // documento inexistente -> nada que borrar, se ignora
+        .then(() => setSaveErr(false))
+        .finally(() => { pendingWrites.current = Math.max(0, pendingWrites.current - 1); });
+    }
   };
   const moveScout = (id, dir) => {
     if (!isAdmin) return;
@@ -717,14 +762,23 @@ export default function RoverDashboard() {
     const cur = dataRef.current.attendance;
     const k = attKey(scoutId, date);
     const curr = cur[k];
-    if (!curr) { saveAtt({ ...cur, [k]: { status: "presente", note: "" } }); return; }
+    if (!curr) {
+      const val = { status: "presente", note: "" };
+      setAttendance({ ...cur, [k]: val });
+      persistField("attendance", k, val);
+      return;
+    }
     const idx = ATT_CYCLE.indexOf(curr.status);
     if (idx === ATT_CYCLE.length - 1) {
+      // último estado del ciclo -> borrar la clave de verdad (deleteField)
       const na = { ...cur };
       delete na[k];
-      saveAtt(na);
+      setAttendance(na);
+      persistField("attendance", k, null);
     } else {
-      saveAtt({ ...cur, [k]: { ...curr, status: ATT_CYCLE[idx + 1] } });
+      const val = { ...curr, status: ATT_CYCLE[idx + 1] };
+      setAttendance({ ...cur, [k]: val });
+      persistField("attendance", k, val);
     }
   };
 
